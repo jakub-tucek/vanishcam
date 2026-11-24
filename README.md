@@ -83,7 +83,7 @@ installed it disappears.
 | Key | Effect | Gesture |
 | --- | --- | --- |
 | `1` | Normal | V sign (index and middle finger): dissolve |
-| `2` | Naruto | Palms pressed together, both hands fully in view, for 0.3 s: smoke and a falling log |
+| `2` | Naruto | Hand seal for 0.3 s: palms pressed together, fingers straight, closed and pointing up, both hands fully in view. The preview says which part is missing |
 | `3` | Particles | V sign: you break into drifting particles |
 | `4` | Goku | Two joined fingers on the forehead for 0.3 s: teleport; repeat to return |
 | `5` | Itachi | Both hands touching at the chest: flock of crows; repeat to return |

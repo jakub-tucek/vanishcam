@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import cv2
@@ -13,33 +14,123 @@ EFFECT_SECONDS = 1.45
 LOG_PATH = Path(__file__).resolve().parent / "assets" / "substitution_log.png"
 
 
-def joined_hands_from_landmarks(hands, width: int, height: int) -> bool:
-    """Recognize two nearby, similarly oriented open hands in image space."""
+FINGERS = ((5, 6, 7, 8), (9, 10, 11, 12), (13, 14, 15, 16), (17, 18, 19, 20))
+WRIST, MIDDLE_KNUCKLE = 0, 9
+PALM = (0, 5, 9, 13, 17)
+
+# Thresholds relative to hand length (wrist to middle knuckle), so they hold at any distance.
+STRAIGHT_MIN = 0.8        # Knuckle-to-tip chord vs path along the finger; curled ~0.5.
+TOGETHER_MAX = 0.4        # Widest gap between neighbouring fingertips; splayed ~0.6+.
+UP_MAX_DEGREES = 40.0     # Wrist-to-knuckle direction vs straight up in the image.
+PALMS_MAX = 0.6           # Distance between the two palm centres.
+TIPS_MAX = 0.7            # Distance between the two middle fingertips.
+SIZE_RATIO_MAX = 1.6      # The two hands must look about the same size.
+
+
+@dataclass(frozen=True)
+class HandSeal:
+    """Which parts of the palms-together seal are present; every part must hold."""
+
+    hands: int
+    in_frame: bool = False
+    fingers_straight: bool = False
+    fingers_together: bool = False
+    pointing_up: bool = False
+    palms_together: bool = False
+    measures: dict[str, float] = field(default_factory=dict, compare=False)
+
+    @property
+    def ok(self) -> bool:
+        return (self.hands >= 2 and self.in_frame and self.fingers_straight
+                and self.fingers_together and self.pointing_up and self.palms_together)
+
+    def describe(self) -> str:
+        if self.hands < 2:
+            return f"Hands seen: {self.hands} (need both)"
+        if not self.in_frame:
+            return "Hands seen: 2, but cut off by the frame edge"
+        mark = {True: "yes", False: "no"}
+        return (f"Straight fingers: {mark[self.fingers_straight]}   "
+                f"together: {mark[self.fingers_together]}   "
+                f"pointing up: {mark[self.pointing_up]}   "
+                f"palms touching: {mark[self.palms_together]}")
+
+
+def _hand_length(points: np.ndarray) -> float:
+    return float(np.linalg.norm(points[MIDDLE_KNUCKLE] - points[WRIST]))
+
+
+def _straightness(points: np.ndarray) -> float:
+    """Least straight finger: knuckle-to-tip chord / path along the finger (1.0 = straight)."""
+    ratios = []
+    for joints in FINGERS:
+        segments = sum(float(np.linalg.norm(points[b] - points[a]))
+                       for a, b in zip(joints, joints[1:]))
+        chord = float(np.linalg.norm(points[joints[-1]] - points[joints[0]]))
+        ratios.append(chord / segments if segments > 0 else 0.0)
+    return min(ratios)
+
+
+def _finger_gap(points: np.ndarray) -> float:
+    """Widest gap between neighbouring fingertips, relative to hand length."""
+    tips = [points[joints[-1]] for joints in FINGERS]
+    widest = max(float(np.linalg.norm(b - a)) for a, b in zip(tips, tips[1:]))
+    return widest / max(_hand_length(points), 1e-6)
+
+
+def analyze_hand_seal(hands, width: int, height: int, world_hands=None) -> HandSeal:
+    """Check the Naruto seal: both palms pressed together, fingers straight, closed and up.
+
+    hands are image landmarks normalised to the frame; world_hands (metric 3D, optional)
+    give each hand's shape independent of how it is turned towards the camera.
+    """
     if len(hands) < 2:
-        return False
+        return HandSeal(hands=len(hands))
+    pair = [hand for hand in hands[:2] if len(hand) == 21]
+    if len(pair) != 2:
+        return HandSeal(hands=len(pair))
     # Hands cut off by the frame edge (e.g. resting on a knee below the camera) are guesses
-    # by the landmarker, not a deliberate palms-together pose.
-    if any(not (0.0 <= p.x <= 1.0 and 0.0 <= p.y <= 1.0) for hand in hands[:2] for p in hand):
-        return False
-    points = [np.array([(p.x * width, p.y * height) for p in hand])
-              for hand in hands[:2] if len(hand) == 21]
-    if len(points) != 2 or not all(np.isfinite(hand).all() for hand in points):
-        return False
-    palms = [hand[[0, 5, 9, 13, 17]].mean(axis=0) for hand in points]
-    scale = [max(float(np.linalg.norm(hand[5] - hand[17])),
-                 float(np.linalg.norm(hand[0] - hand[9]))) for hand in points]
-    if min(scale) < 8.0 or max(scale) > min(scale) * 2.2:
-        return False
-    size = sum(scale) * 0.5
-    directions = [hand[9] - hand[0] for hand in points]
-    alignment = float(np.dot(*directions) /
-                      max(1e-6, np.linalg.norm(directions[0]) * np.linalg.norm(directions[1])))
-    fingertips = [hand[[8, 12, 16, 20]].mean(axis=0) for hand in points]
-    return (
-        alignment > 0.25
-        and np.linalg.norm(palms[0] - palms[1]) < size * 1.55
-        and np.linalg.norm(fingertips[0] - fingertips[1]) < size * 1.9
+    # by the landmarker, not a deliberate pose.
+    if any(not (0.0 <= p.x <= 1.0 and 0.0 <= p.y <= 1.0) for hand in pair for p in hand):
+        return HandSeal(hands=2)
+    image = [np.array([(p.x * width, p.y * height) for p in hand]) for hand in pair]
+    if not all(np.isfinite(points).all() for points in image):
+        return HandSeal(hands=2)
+    shapes = image
+    if world_hands is not None and len(world_hands) >= 2 and all(len(h) == 21 for h in world_hands[:2]):
+        shapes = [np.array([(p.x, p.y, p.z) for p in hand]) for hand in world_hands[:2]]
+
+    lengths = [_hand_length(points) for points in image]
+    if min(lengths) < 8.0 or max(lengths) > min(lengths) * SIZE_RATIO_MAX:
+        return HandSeal(hands=2, in_frame=True)
+    length = sum(lengths) / 2
+
+    def tilt(points: np.ndarray) -> float:
+        direction = points[MIDDLE_KNUCKLE] - points[WRIST]
+        # Image y grows downwards, so "up" is negative y.
+        return math.degrees(math.atan2(abs(direction[0]), -direction[1]))
+
+    palms = [points[list(PALM)].mean(axis=0) for points in image]
+    measures = {
+        "straight": min(_straightness(points) for points in shapes),
+        "gap": max(_finger_gap(points) for points in shapes),
+        "tilt": max(tilt(points) for points in image),
+        "palms": float(np.linalg.norm(palms[0] - palms[1])) / length,
+        "tips": float(np.linalg.norm(image[0][12] - image[1][12])) / length,
+    }
+    return HandSeal(
+        hands=2,
+        in_frame=True,
+        fingers_straight=measures["straight"] >= STRAIGHT_MIN,
+        fingers_together=measures["gap"] < TOGETHER_MAX,
+        pointing_up=measures["tilt"] < UP_MAX_DEGREES,
+        palms_together=measures["palms"] < PALMS_MAX and measures["tips"] < TIPS_MAX,
+        measures=measures,
     )
+
+
+def joined_hands_from_landmarks(hands, width: int, height: int, world_hands=None) -> bool:
+    return analyze_hand_seal(hands, width, height, world_hands).ok
 
 
 def substitution_anchor(mask: np.ndarray) -> tuple[int, int, int]:

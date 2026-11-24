@@ -91,6 +91,23 @@ installed it disappears.
 While vanished (Normal, Particles, Goku) the room stays live and only your silhouette is
 replaced by the captured background, matched to the camera's current exposure.
 
+### Background blur and custom images
+
+Press `B` (or click **B background** in the preview) to cycle: **off → blur → each image**
+in `backgrounds/`. The choice is remembered. Drop any `.jpg`, `.png` or `.webp` into
+`backgrounds/` (git ignores its contents); images are scaled to fill the frame. The style
+sits underneath the effects, so smoke, crows and particles still show, and while you are
+vanished the whole frame shows the chosen background.
+
+```sh
+./vanishcam --background blur
+./vanishcam --background ~/Pictures/office.jpg   # or just a file name from backgrounds/
+```
+
+To reuse a background you generated in Google Meet: apply it in Meet, step out of the
+frame so only the background shows in your self-view, and take a screenshot of it
+(`Cmd+Shift+4`, then crop). Meet does not offer a download, so this is a 720p-ish copy.
+
 ### Controls
 
 Keys work while the preview window has focus. The effect chips at the top and the buttons
@@ -101,6 +118,7 @@ at the bottom of the preview are clickable too.
 | `1`–`5` | Switch effect (the captured background is kept) |
 | `V` / `R` | Vanish / reappear manually (not in Goku) |
 | `Space` | Capture a new background |
+| `B` | Background: off → blur → your images |
 | `F` | Fullscreen |
 | `H` | Hide or show the button bar |
 | `Q` / `Esc` | Quit |
@@ -113,6 +131,7 @@ orientation (the preview is mirrored, like a mirror).
 ```sh
 ./vanishcam --mode goku --camera 0   # skip the launcher
 ./vanishcam --goku-delay 1           # Goku hold time in seconds (default 0.3)
+./vanishcam --background blur        # off, blur, or an image (default: last choice)
 ./vanishcam --no-virtual-camera      # skip the OBS driver
 ./vanishcam --virtual-camera         # exit if the virtual camera is unavailable
 ./vanishcam --no-hud                 # plain preview
@@ -143,7 +162,7 @@ orientation (the preview is mirrored, like a mirror).
 ```
 
 Layout: `vanish_cam.py` (app, launcher, overlay), `*_effect.py` (effects),
-`vanish_sound.py`, `mediapipe_log_filter.py` (quiets MediaPipe logs), `models/`,
+`vanish_sound.py`, `mediapipe_log_filter.py` (quiets MediaPipe logs), `backgrounds/`, `models/`,
 `assets/`, `tests/`.
 
 ## Credits

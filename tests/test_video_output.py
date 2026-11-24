@@ -3,6 +3,8 @@ import threading
 import time
 import unittest
 from contextlib import ExitStack
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 from unittest.mock import Mock, call, patch
 
@@ -292,6 +294,106 @@ class LoopControlTests(unittest.TestCase):
         _, messages = self.run_loop("normal", times, keys)
         ready = [m for m in messages if m.startswith("[Webcam] Background ready")]
         self.assertEqual(len(ready), 2)
+
+
+class BackgroundStyleTests(unittest.TestCase):
+    def setUp(self):
+        rng = np.random.default_rng(3)
+        self.frame = rng.integers(0, 255, (90, 160, 3), dtype=np.uint8)
+        self.mask = np.zeros((90, 160), np.float32)
+        self.mask[20:80, 60:100] = 1.0
+
+    def style(self, choice, images=()):
+        style = app.BackgroundStyle(list(images), choice)
+        style.update_mask(self.mask, 0.0)
+        return style
+
+    def test_off_returns_the_frame_untouched(self):
+        style = self.style("off")
+        self.assertIs(style.scene(self.frame), self.frame)
+        self.assertFalse(style.mask_due(1.0))
+
+    def test_blur_keeps_the_person_sharp_and_softens_the_room(self):
+        scene = self.style("blur").scene(self.frame)
+        np.testing.assert_array_equal(scene[40:60, 70:90], self.frame[40:60, 70:90])
+        room = scene[:, :40].astype(float)
+        self.assertLess(np.abs(np.diff(room, axis=1)).mean(),
+                        np.abs(np.diff(self.frame[:, :40].astype(float), axis=1)).mean() / 3)
+
+    def test_image_replaces_the_room_and_hides_everything_when_vanished(self):
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "beach.png"
+            app.cv2.imwrite(str(path), np.full((300, 300, 3), (200, 100, 50), np.uint8))
+            style = self.style(str(path), [path])
+            scene = style.scene(self.frame)
+            np.testing.assert_array_equal(scene[5, 5], (200, 100, 50))
+            np.testing.assert_array_equal(scene[50, 80], self.frame[50, 80])
+            vanished = style.scene(self.frame, person_visible=False)
+            np.testing.assert_array_equal(vanished[50, 80], (200, 100, 50))
+            self.assertEqual(style.label, "beach")
+
+    def test_plate_is_cached_per_background_and_style(self):
+        style = self.style("blur")
+        background = self.frame.copy()
+        plate = style.plate(background)
+        self.assertIs(style.plate(background), plate)
+        self.assertIsNot(style.plate(background.copy()), plate)
+        self.assertIsNone(style.plate(None))
+
+    def test_cycle_goes_off_blur_then_each_image(self):
+        style = app.BackgroundStyle([Path("a.png"), Path("b.jpg")], "off")
+        labels = []
+        for _ in range(4):
+            style.cycle()
+            labels.append(style.label)
+        self.assertEqual(labels, ["blur", "a", "b", "off"])
+
+    def test_cover_resize_fills_without_distortion(self):
+        wide = np.zeros((100, 400, 3), np.uint8)
+        wide[:, 150:250] = 255  # A centred white band survives the crop.
+        result = app.cover_resize(wide, 160, 90)
+        self.assertEqual(result.shape, (90, 160, 3))
+        self.assertEqual(result[45, 80, 0], 255)
+
+    def test_setup_resolves_files_and_rejects_missing_ones(self):
+        self.assertEqual(app.background_setup("blur")[1], "blur")
+        self.assertEqual(app.background_setup(None)[1], "off")
+        with self.assertRaisesRegex(RuntimeError, "not found"):
+            app.background_setup("/nope/missing.png")
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "office.jpg"
+            app.cv2.imwrite(str(path), np.zeros((10, 10, 3), np.uint8))
+            images, choice = app.background_setup(str(path))
+            self.assertEqual(choice, str(path))
+            self.assertIn(path, images)
+
+    def test_live_loop_blurs_the_output_but_not_recognition(self):
+        frame = self.frame.copy()
+        capture = Mock()
+        capture.read.return_value = (True, frame)
+        camera = Mock(width=160, height=90)
+        recognized = []
+        with ExitStack() as mocks:
+            mocks.enter_context(patch.object(app, "download_models"))
+            mocks.enter_context(patch.object(app, "open_camera", return_value=capture))
+            mocks.enter_context(patch.object(app, "create_tasks", return_value=(Mock(), Mock())))
+            mocks.enter_context(patch.object(app, "open_virtual_camera", return_value=camera))
+            mocks.enter_context(patch.object(app, "person_mask", return_value=self.mask))
+            mocks.enter_context(patch.object(app, "recognize_gesture", side_effect=lambda r, image, ts: (
+                recognized.append(image), ("No_Hand", 0.0))[1]))
+            mocks.enter_context(patch.object(app, "to_mp_image", side_effect=lambda image: image))
+            mocks.enter_context(patch.object(app.time, "perf_counter", side_effect=(0, 0, 0.1, 4.1, 4.3, 4.5)))
+            for name in ("namedWindow", "resizeWindow", "destroyAllWindows", "imshow"):
+                mocks.enter_context(patch.object(app.cv2, name))
+            mocks.enter_context(patch.object(app.cv2, "getWindowProperty", return_value=1))
+            mocks.enter_context(patch.object(app.cv2, "waitKey", side_effect=(0, 0, 0, ord("q"))))
+            mocks.enter_context(patch("builtins.print"))
+            with ExitStack() as resources:
+                app.run_camera(arguments(background="blur"), resources, "normal")
+        sent = camera.send.call_args.args[0]
+        np.testing.assert_array_equal(sent[50, 80], frame[50, 80])  # Person stays sharp.
+        self.assertFalse(np.array_equal(sent[:, :40], frame[:, :40]))  # Room is blurred.
+        self.assertTrue(recognized and all(image is frame for image in recognized))
 
 
 class MirrorTests(unittest.TestCase):

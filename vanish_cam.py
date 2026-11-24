@@ -193,6 +193,11 @@ def parse_args() -> argparse.Namespace:
         help="Status overlay in the preview window only; never sent to the virtual camera",
     )
     parser.add_argument(
+        "--background", default=None, metavar="off|blur|IMAGE",
+        help="Blur or replace the room behind you (image path or a file in backgrounds/); "
+             "B cycles it while running. Default: last choice",
+    )
+    parser.add_argument(
         "--goku-delay", type=positive_seconds, default=None,
         help=f"Goku gesture hold time in seconds (default: {HOLD_SECONDS:g})",
     )
@@ -735,6 +740,127 @@ def apply_gain(image: np.ndarray, gain: np.ndarray | None) -> np.ndarray:
     return np.clip(image.astype(np.float32) * gain, 0, 255).astype(np.uint8)
 
 
+BACKGROUNDS_DIR = APP_DIR / "backgrounds"
+BACKGROUND_SUFFIXES = (".jpg", ".jpeg", ".png", ".webp")
+
+
+def find_background_image(name: str) -> Path | None:
+    for path in (Path(name).expanduser(), BACKGROUNDS_DIR / name):
+        if path.is_file() and path.suffix.lower() in BACKGROUND_SUFFIXES:
+            return path
+    return None
+
+
+def background_setup(requested: str | None) -> tuple[list[Path], str]:
+    """Images to cycle through with B, and the style to start with."""
+    images = sorted(path for path in BACKGROUNDS_DIR.glob("*")
+                    if path.suffix.lower() in BACKGROUND_SUFFIXES)
+    if requested in (None, "off", "blur"):
+        return images, requested or "off"
+    path = find_background_image(requested)
+    if path is None:
+        raise RuntimeError(f"Background image not found: {requested}")
+    if path not in images:
+        images.insert(0, path)
+    return images, str(path)
+
+
+def cover_resize(image: np.ndarray, width: int, height: int) -> np.ndarray:
+    """Scale to fill width x height, cropping the overflow like CSS background-size: cover."""
+    source_height, source_width = image.shape[:2]
+    scale = max(width / source_width, height / source_height)
+    resized = cv2.resize(image, (max(width, round(source_width * scale)),
+                                 max(height, round(source_height * scale))),
+                         interpolation=cv2.INTER_AREA if scale < 1 else cv2.INTER_LINEAR)
+    top = (resized.shape[0] - height) // 2
+    left = (resized.shape[1] - width) // 2
+    return resized[top:top + height, left:left + width]
+
+
+class BackgroundStyle:
+    """Blurs or replaces everything behind the person.
+
+    It styles both the live frame and the captured background plate, so the vanish effects
+    still draw their smoke, crows and particles on top of the chosen background.
+    """
+
+    MASK_INTERVAL = 0.05
+
+    def __init__(self, images: list[Path], choice: str = "off"):
+        self.choices = ["off", "blur", *(str(path) for path in images)]
+        self.index = self.choices.index(choice) if choice in self.choices else 0
+        self._mask: np.ndarray | None = None
+        self._mask_at = float("-inf")
+        self._images: dict[str, np.ndarray] = {}
+        self._plate_source: np.ndarray | None = None
+        self._plate_index = -1
+        self._plate: np.ndarray | None = None
+
+    @property
+    def choice(self) -> str:
+        return self.choices[self.index]
+
+    @property
+    def enabled(self) -> bool:
+        return self.choice != "off"
+
+    @property
+    def label(self) -> str:
+        return self.choice if self.choice in ("off", "blur") else Path(self.choice).stem
+
+    def cycle(self) -> None:
+        self.index = (self.index + 1) % len(self.choices)
+        self._mask = None
+        self._mask_at = float("-inf")
+
+    def mask_due(self, now: float) -> bool:
+        return self.enabled and now - self._mask_at >= self.MASK_INTERVAL
+
+    def update_mask(self, mask: np.ndarray, now: float) -> None:
+        crisp = smoothstep(0.25, 0.75, mask).astype(np.float32)
+        same_shape = self._mask is not None and self._mask.shape == crisp.shape
+        self._mask = crisp * 0.6 + self._mask * 0.4 if same_shape else crisp
+        self._mask_at = now
+
+    def _backdrop(self, frame: np.ndarray) -> np.ndarray:
+        height, width = frame.shape[:2]
+        if self.choice == "blur":
+            small = cv2.resize(frame, (max(1, width // 8), max(1, height // 8)),
+                               interpolation=cv2.INTER_AREA)
+            small = cv2.GaussianBlur(small, (0, 0), sigmaX=2.5, sigmaY=2.5)
+            return cv2.resize(small, (width, height), interpolation=cv2.INTER_LINEAR)
+        key = f"{self.choice}:{width}x{height}"
+        if key not in self._images:
+            image = cv2.imread(self.choice, cv2.IMREAD_COLOR)
+            if image is None:
+                raise RuntimeError(f"Cannot read background image: {self.choice}")
+            self._images[key] = cover_resize(image, width, height)
+        return self._images[key]
+
+    def scene(self, frame: np.ndarray, person_visible: bool = True) -> np.ndarray:
+        """The live frame with the person kept and everything else styled.
+
+        While the person is vanished the whole frame is styled, so a stale mask cannot
+        leave a sharp or live patch where they used to be.
+        """
+        if not self.enabled:
+            return frame
+        if not person_visible:
+            return self._backdrop(frame)
+        if self._mask is None or self._mask.shape != frame.shape[:2]:
+            return frame
+        return alpha_composite(frame, self._backdrop(frame), self._mask)
+
+    def plate(self, background: np.ndarray | None) -> np.ndarray | None:
+        """The captured empty-room background, styled the same way."""
+        if not self.enabled or background is None:
+            return background
+        if background is not self._plate_source or self.index != self._plate_index:
+            self._plate_source, self._plate_index = background, self.index
+            self._plate = self._backdrop(background).copy()
+        return self._plate
+
+
 def alpha_composite(person: np.ndarray, background: np.ndarray, alpha: np.ndarray) -> np.ndarray:
     alpha_3 = alpha[:, :, None]
     return (
@@ -1056,7 +1182,7 @@ def _hud_box(image, x0, y0, x1, y1, color=None) -> None:
 
 HUD_HELP_ITEMS = (
     ("V vanish", "v"), ("R reappear", "r"), ("SPACE new background", " "),
-    ("F fullscreen", "f"), ("H hide help", "h"), ("Q quit", "q"),
+    ("B background", "b"), ("F fullscreen", "f"), ("H hide help", "h"), ("Q quit", "q"),
 )
 
 
@@ -1073,6 +1199,7 @@ def _hud_button(image, label, x, top, bottom, scale, active=False) -> tuple[int,
 
 def draw_hud(frame: np.ndarray, mode: str, modes: tuple[str, ...], status: str, detail: str,
              vcam_text: str, vcam_color: tuple[int, int, int], show_help: bool,
+             background_label: str = "off",
              ) -> tuple[np.ndarray, list[tuple[tuple[int, int, int, int], int]]]:
     """Preview-only overlay plus its click targets; the virtual camera gets the clean frame."""
     image = frame.copy()
@@ -1112,6 +1239,8 @@ def draw_hud(frame: np.ndarray, mode: str, modes: tuple[str, ...], status: str, 
     for label, key in items:
         if mode == "goku" and key in "vr":
             continue
+        if key == "b":
+            label = f"{label}: {background_label}"
         box = _hud_button(image, label, x, top, bottom, scale)
         targets.append((box, ord(key)))
         x = box[2] + gap
@@ -1193,6 +1322,11 @@ def run() -> int:
             return 0
         mode, args.camera = picked
         save_settings(mode=mode, camera=args.camera)
+    if hasattr(args, "background") and args.background is None:
+        remembered = load_settings().get("background")
+        if remembered in ("off", "blur") or (isinstance(remembered, str)
+                                             and find_background_image(remembered)):
+            args.background = remembered
     with ExitStack() as resources:
         return run_camera(args, resources, mode)
 
@@ -1219,6 +1353,7 @@ def run_camera(args: argparse.Namespace, resources: ExitStack, mode: str) -> int
 
     segmenter, recognizer, log_sprite, vanish_sound = load_kit(mode)
     outputs = VideoOutputs(args, resources)
+    style = BackgroundStyle(*background_setup(getattr(args, "background", None)))
     resources.callback(cv2.destroyAllWindows)
     cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
     cv2.resizeWindow(WINDOW_NAME, args.width, args.height)
@@ -1296,7 +1431,7 @@ def run_camera(args: argparse.Namespace, resources: ExitStack, mode: str) -> int
     started = time.perf_counter()
     print("[Webcam] Step out of the frame for 4 seconds: capturing the background.")
     print("[Webcam] Keys in the preview window: 1-5 effect, SPACE new background, "
-          "R reappear, V vanish, F fullscreen, H help, Q quit.")
+          "R reappear, V vanish, B blur/background, F fullscreen, H help, Q quit.")
 
     raise_pending = True
     try:
@@ -1312,6 +1447,14 @@ def run_camera(args: argparse.Namespace, resources: ExitStack, mode: str) -> int
 
             timestamp_floor = int((now - started) * 1000)
             mp_image = None
+            person_visible = state.phase != "vanished"
+            if person_visible and style.mask_due(now):
+                mp_image = to_mp_image(camera_frame)
+                style.update_mask(person_mask(segmenter, mp_image, stamp(), width, height), now)
+            # Effects render on the styled scene and plate; recognition and the background
+            # capture keep using the raw camera frame.
+            scene_frame = style.scene(camera_frame, person_visible)
+            scene_background = style.plate(background)
 
             if (mode == "itachi" and background is not None
                     and state.phase in ("ready", "vanished")
@@ -1327,7 +1470,7 @@ def run_camera(args: argparse.Namespace, resources: ExitStack, mode: str) -> int
                     last_gesture_report = now
                 if itachi_gate.update(touching, now):
                     try:
-                        itachi_effect = ItachiCrowEffect(camera_frame, mask)
+                        itachi_effect = ItachiCrowEffect(scene_frame, mask)
                     except ValueError:
                         itachi_gate.reset()
                     else:
@@ -1358,7 +1501,7 @@ def run_camera(args: argparse.Namespace, resources: ExitStack, mode: str) -> int
                     print(f"[Goku] {action}!")
                     goku_countdown_remaining = None
                     mask = person_mask(segmenter, mp_image, stamp(), width, height)
-                    goku_effect = GokuTeleport(camera_frame, background, mask)
+                    goku_effect = GokuTeleport(scene_frame, scene_background, mask)
                     appearing = state.phase == "vanished"
                     state.phase = "goku_appearing" if appearing else "goku_vanishing"
                     state.vanish_started = time.perf_counter()
@@ -1391,25 +1534,25 @@ def run_camera(args: argparse.Namespace, resources: ExitStack, mode: str) -> int
                     background_samples.clear()
                     state.phase = "ready"
                     print("[Webcam] Background ready. You can step back into the frame.")
-                display = camera_frame
+                display = scene_frame
 
             elif background is None:
                 state.phase = "calibrating"
                 state.calibration_started = now
-                display = camera_frame
+                display = scene_frame
 
             elif mode == "goku" and state.phase in ("goku_vanishing", "goku_appearing"):
                 appearing = state.phase == "goku_appearing"
                 age = time.perf_counter() - state.vanish_started
-                display = goku_effect.render(background, age, appearing)
+                display = goku_effect.render(scene_background, age, appearing)
                 if age >= TELEPORT_SECONDS:
                     state.phase = "ready" if appearing else "vanished"
-                    vanished_frame = None if appearing else background.copy()
+                    vanished_frame = None if appearing else scene_background.copy()
 
             elif mode == "itachi" and state.phase in ("itachi_disappearing", "itachi_appearing"):
                 appearing = state.phase == "itachi_appearing"
                 age = max(0.0, time.perf_counter() - state.vanish_started)
-                display = itachi_effect.render(background, age, appearing)
+                display = itachi_effect.render(scene_background, age, appearing)
                 if age >= ITACHI_SECONDS:
                     state.phase = "ready" if appearing else "vanished"
                     vanished_frame = None if appearing else display
@@ -1417,7 +1560,7 @@ def run_camera(args: argparse.Namespace, resources: ExitStack, mode: str) -> int
 
             elif state.phase == "vanished":
                 if vanished_frame is None:
-                    vanished_frame = background.copy()
+                    vanished_frame = scene_background.copy()
                     if mode == "naruto" and log_anchor is not None:
                         overlay_log(vanished_frame, log_sprite, landed_log_anchor(log_anchor, height),
                                     cache=log_cache)
@@ -1433,9 +1576,9 @@ def run_camera(args: argparse.Namespace, resources: ExitStack, mode: str) -> int
                         hidden_mask = fresh if hidden_mask is None else np.maximum(fresh, hidden_mask * 0.8)
                         last_mask = hidden_mask
                         last_mask_at = now
-                        exposure_gain = match_exposure(vanished_frame, camera_frame, hidden_mask, exposure_gain)
+                        exposure_gain = match_exposure(vanished_frame, scene_frame, hidden_mask, exposure_gain)
                         hidden_base = apply_gain(vanished_frame, exposure_gain)
-                    display = alpha_composite(hidden_base, camera_frame, hidden_mask)
+                    display = alpha_composite(hidden_base, scene_frame, hidden_mask)
                 else:
                     display = vanished_frame
 
@@ -1492,21 +1635,21 @@ def run_camera(args: argparse.Namespace, resources: ExitStack, mode: str) -> int
                 if mode == "naruto" and state.phase == "naruto_vanishing":
                     age = max(0.04, time.perf_counter() - state.vanish_started)
                     display = render_substitution(
-                        camera_frame, background, mask, log_sprite, log_anchor, age, log_cache
+                        scene_frame, scene_background, mask, log_sprite, log_anchor, age, log_cache
                     )
                     if age >= EFFECT_SECONDS:
                         state.phase = "vanished"
                         vanished_frame = display
                 elif mode == "particles" and state.phase == "vanishing":
                     if particle_effect is None:
-                        particle_effect = ParticleEffect(camera_frame, mask)
+                        particle_effect = ParticleEffect(scene_frame, mask)
                     age = time.perf_counter() - state.vanish_started
-                    display = particle_effect.render(background, age)
+                    display = particle_effect.render(scene_background, age)
                     if age >= PARTICLE_SECONDS:
                         state.phase = "vanished"
-                        vanished_frame = background.copy()
+                        vanished_frame = scene_background.copy()
                 elif state.phase == "ready":
-                    display = camera_frame
+                    display = scene_frame
                 else:
                     progress = 0.0
                     if state.phase == "vanishing" and state.vanish_started is not None:
@@ -1516,7 +1659,7 @@ def run_camera(args: argparse.Namespace, resources: ExitStack, mode: str) -> int
                         if progress >= 1.0:
                             state.phase = "vanished"
                     display = apply_dissolve(
-                        camera_frame, background, mask, progress, dissolve_field, sparkle_noise
+                        scene_frame, scene_background, mask, progress, dissolve_field, sparkle_noise
                     )
                     if state.phase == "vanished":
                         vanished_frame = display
@@ -1533,7 +1676,7 @@ def run_camera(args: argparse.Namespace, resources: ExitStack, mode: str) -> int
                                goku_countdown_remaining),
                     hud_detail if state.phase == "ready" or (
                         state.phase == "vanished" and mode in ("goku", "itachi")) else "",
-                    vcam_text, vcam_color, hud_help,
+                    vcam_text, vcam_color, hud_help, style.label,
                 )
             cv2.imshow(WINDOW_NAME, preview)
             if raise_pending:
@@ -1559,6 +1702,12 @@ def run_camera(args: argparse.Namespace, resources: ExitStack, mode: str) -> int
                     state.phase = "ready"
             elif key in (ord("h"), ord("H")):
                 hud_help = not hud_help
+            elif key in (ord("b"), ord("B")):
+                style.cycle()
+                save_settings(background=style.choice)
+                print(f"[Webcam] Background: {style.label}")
+                if state.phase == "vanished":
+                    vanished_frame = None
             elif key == ord(" "):
                 reset_effect()
                 state.phase = "calibrating"
@@ -1571,7 +1720,7 @@ def run_camera(args: argparse.Namespace, resources: ExitStack, mode: str) -> int
                     mp_image = to_mp_image(camera_frame)
                     mask = person_mask(segmenter, mp_image, stamp(), width, height)
                     try:
-                        itachi_effect = ItachiCrowEffect(camera_frame, mask)
+                        itachi_effect = ItachiCrowEffect(scene_frame, mask)
                     except ValueError:
                         print("[Itachi] Step back into the frame before reappearing.")
                     else:
@@ -1585,7 +1734,7 @@ def run_camera(args: argparse.Namespace, resources: ExitStack, mode: str) -> int
                 mp_image = to_mp_image(camera_frame)
                 mask = person_mask(segmenter, mp_image, stamp(), width, height)
                 try:
-                    itachi_effect = ItachiCrowEffect(camera_frame, mask)
+                    itachi_effect = ItachiCrowEffect(scene_frame, mask)
                 except ValueError:
                     print("[Itachi] No person detected.")
                 else:

@@ -1,4 +1,6 @@
 import argparse
+import threading
+import time
 import unittest
 from contextlib import ExitStack
 from types import SimpleNamespace
@@ -76,31 +78,44 @@ class VirtualCameraTests(unittest.TestCase):
 
 
 class LauncherTests(unittest.TestCase):
+    """The preview camera opens on a background thread, so keys are fed with small pauses
+    and the launcher may need several idle iterations before a frame arrives."""
+
     def launch(self, keys, cameras, mode="normal", camera_index=0):
+        pending = list(keys)
+        calls = [0]
+
+        def wait_key(delay):
+            calls[0] += 1
+            if calls[0] > 2000:
+                raise AssertionError("launcher never finished")
+            time.sleep(0.005)
+            return pending.pop(0) if pending else 255
+
         with patch.object(app, "open_camera", side_effect=cameras) as opening, \
              patch.object(app.cv2, "namedWindow"), \
              patch.object(app.cv2, "setMouseCallback"), \
              patch.object(app.cv2, "imshow"), \
              patch.object(app.cv2, "destroyWindow"), \
              patch.object(app.cv2, "getWindowProperty", return_value=1), \
-             patch.object(app.cv2, "waitKey", side_effect=keys):
+             patch.object(app.cv2, "waitKey", side_effect=wait_key):
             result = app.choose_launch(app.ALL_MODES, mode, camera_index)
         return result, opening
 
     @staticmethod
-    def camera(*reads):
+    def camera(first_reads=()):
+        reads = list(first_reads)
+        frame = np.zeros((24, 40, 3), np.uint8)
         camera = Mock()
-        camera.read.side_effect = reads or None
-        if not reads:
-            camera.read.return_value = (True, np.zeros((24, 40, 3), np.uint8))
+        camera.read.side_effect = lambda: reads.pop(0) if reads else (True, frame)
         return camera
 
     def test_keys_pick_effect_and_switch_camera_preview(self):
         cameras = [self.camera(), self.camera()]
         result, opening = self.launch((ord("4"), ord("d"), 13), cameras)
         self.assertEqual(result, ("goku", 1))
-        opening.assert_has_calls((call(0, 640, 360), call(1, 640, 360)))
-        for camera in cameras:
+        self.assertEqual(opening.call_args, call(1, 640, 360))
+        for camera in cameras[:opening.call_count]:
             camera.release.assert_called_once()
 
     def test_every_effect_has_a_number_key(self):
@@ -113,17 +128,33 @@ class LauncherTests(unittest.TestCase):
         self.assertEqual(result, ("itachi", 2))
         opening.assert_called_once_with(2, 640, 360)
 
-    def test_waits_for_an_available_device(self):
+    def test_dead_camera_cancels_start_until_a_working_one_is_picked(self):
         camera = self.camera()
-        result, _ = self.launch((13, ord("d"), 13), (RuntimeError("missing"), camera))
+        keys = (13,) + (255,) * 20 + (ord("d"), 13)
+        result, _ = self.launch(keys, (RuntimeError("missing"), camera))
         self.assertEqual(result, ("normal", 1))
         camera.release.assert_called_once()
 
-    def test_waits_for_first_preview_frame(self):
-        camera = self.camera((False, None), (True, np.zeros((24, 40, 3), np.uint8)))
-        result, _ = self.launch((13, 13), [camera])
+    def test_enter_waits_for_first_preview_frame(self):
+        camera = self.camera([(False, None)] * 3)
+        result, _ = self.launch((13,), [camera])
         self.assertEqual(result, ("normal", 0))
-        self.assertEqual(camera.read.call_count, 2)
+        self.assertGreaterEqual(camera.read.call_count, 4)
+
+    def test_slow_camera_does_not_block_the_window(self):
+        opened = threading.Event()
+
+        def slow_open(index, width, height):
+            time.sleep(0.5)
+            opened.set()
+            return self.camera()
+
+        drawn_before_open = []
+        with patch.object(app, "_draw_launcher", side_effect=lambda *a: drawn_before_open.append(
+                not opened.is_set()) or np.zeros((10, 10, 3), np.uint8)):
+            result, _ = self.launch((13,), slow_open)
+        self.assertEqual(result, ("normal", 0))
+        self.assertGreater(sum(drawn_before_open), 5)
 
     def test_quit_returns_nothing(self):
         result, _ = self.launch((ord("q"),), [self.camera()])
@@ -158,6 +189,43 @@ class RunTests(unittest.TestCase):
         launcher.assert_called_once_with(app.ALL_MODES, "particles", 3, mirror=False)
         save.assert_called_once_with(mode="goku", camera=2)
         self.assertEqual(camera.call_args.args[0].camera, 2)
+
+
+class VideoOutputsTests(unittest.TestCase):
+    def outputs(self, opened, **options):
+        resources = ExitStack()
+        self.addCleanup(resources.close)
+        patcher = patch.object(app, "open_virtual_camera", side_effect=opened)
+        self.opening = patcher.start()
+        self.addCleanup(patcher.stop)
+        return app.VideoOutputs(arguments(**options), resources)
+
+    def test_busy_driver_is_retried_every_few_seconds_until_it_opens(self):
+        camera = Mock(width=40, height=24, device="OBS Virtual Camera")
+        outputs = self.outputs([None, camera])
+        frame = np.zeros((24, 40, 3), np.uint8)
+        outputs.send(frame, 0.0)
+        outputs.send(frame, 1.0)  # Too early for a retry.
+        self.assertEqual(self.opening.call_count, 1)
+        self.assertEqual(outputs.badge(), ("Preview only", app.HUD_IDLE))
+        outputs.send(frame, 3.1)
+        self.assertEqual(self.opening.call_count, 2)
+        camera.send.assert_called_once()
+        self.assertEqual(outputs.badge(), ("Live: OBS Virtual Camera", app.HUD_LIVE))
+
+    def test_disabled_virtual_camera_is_not_retried(self):
+        outputs = self.outputs([None], virtual_camera=False)
+        frame = np.zeros((24, 40, 3), np.uint8)
+        outputs.send(frame, 0.0)
+        outputs.send(frame, 10.0)
+        self.assertEqual(self.opening.call_count, 1)
+
+    def test_badge_names_a_browser_stream_not_meet(self):
+        outputs = self.outputs([None])
+        outputs.browser = Mock(connected=True)
+        self.assertEqual(outputs.badge(), ("Live: browser stream", app.HUD_LIVE))
+        outputs.browser.connected = False
+        self.assertIn("Waiting for Meet", outputs.badge()[0])
 
 
 class LoopControlTests(unittest.TestCase):

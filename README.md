@@ -98,7 +98,7 @@ installed it disappears.
    in a chair, leave the empty chair in place.
 3. Step back in and do the gesture shown at the top of the preview.
 4. In Meet pick the camera **VanishCam** (or **OBS Virtual Camera** in desktop apps). The
-   badge at the top right of the preview says **Live: Meet (browser)** or
+   badge at the top right of the preview says **Live: browser stream** or
    **Live: OBS Virtual Camera** when frames are flowing.
 
 | Key | Effect | Gesture |

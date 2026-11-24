@@ -7,6 +7,7 @@ import json
 import os
 import platform
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -277,16 +278,92 @@ def _draw_launcher(modes, mode, camera_index, frame, status, layout) -> np.ndarr
     return window
 
 
+class CameraFeed:
+    """Opens and reads one webcam on a background thread.
+
+    Opening a missing camera index can block AVFoundation for seconds; doing it here
+    keeps the launcher window responsive while the user flips through cameras.
+    """
+
+    MAX_READ_FAILURES = 10
+
+    def __init__(self, index: int, mirror: bool):
+        self._mirror = mirror
+        self._lock = threading.Lock()
+        self._wanted = index
+        self._frame: np.ndarray | None = None
+        self._failed = False
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def select(self, index: int) -> None:
+        with self._lock:
+            if index != self._wanted:
+                self._wanted, self._frame, self._failed = index, None, False
+
+    def snapshot(self) -> tuple[np.ndarray | None, bool]:
+        with self._lock:
+            return self._frame, self._failed
+
+    def close(self) -> None:
+        self._stop.set()
+        self._thread.join(timeout=5)
+
+    def _run(self) -> None:
+        capture = None
+        opened = None
+        failures = 0
+        try:
+            while not self._stop.is_set():
+                with self._lock:
+                    wanted = self._wanted
+                if wanted != opened:
+                    if capture is not None:
+                        capture.release()
+                    opened, failures = wanted, 0
+                    try:
+                        capture = open_camera(wanted, 640, 360)
+                    except RuntimeError:
+                        capture = None
+                        self._mark_failed(wanted)
+                    continue
+                if capture is None:
+                    self._stop.wait(0.05)
+                    continue
+                ok, image = capture.read()
+                if ok:
+                    failures = 0
+                    self._publish(wanted, cv2.flip(image, 1) if self._mirror else image)
+                else:
+                    failures += 1
+                    if failures >= self.MAX_READ_FAILURES:
+                        capture.release()
+                        capture = None
+                        self._mark_failed(wanted)
+                    else:
+                        self._stop.wait(0.03)
+        finally:
+            if capture is not None:
+                capture.release()
+
+    def _publish(self, index: int, frame: np.ndarray) -> None:
+        with self._lock:
+            if index == self._wanted:
+                self._frame, self._failed = frame, False
+
+    def _mark_failed(self, index: int) -> None:
+        with self._lock:
+            if index == self._wanted:
+                self._frame, self._failed = None, True
+
+
 def choose_launch(modes: tuple[str, ...], mode: str, camera_index: int,
                   mirror: bool = True) -> tuple[str, int] | None:
     """One window: effect cards plus a live preview of the selected webcam."""
     layout = _launch_layout(len(modes))
     selected = {"mode": mode if mode in modes else modes[0],
                 "camera": max(0, min(9, camera_index)), "start": False}
-    opened_index = None
-    capture = None
-    frame = None
-    read_failures = 0
 
     def on_mouse(event, x, y, flags, userdata):
         if event != cv2.EVENT_LBUTTONUP:
@@ -304,32 +381,13 @@ def choose_launch(modes: tuple[str, ...], mode: str, camera_index: int,
     print(f"[Menu] Choose an effect and webcam in the '{LAUNCH_TITLE}' window.", flush=True)
     cv2.namedWindow(LAUNCH_TITLE, cv2.WINDOW_AUTOSIZE)
     cv2.setMouseCallback(LAUNCH_TITLE, on_mouse)
+    feed = CameraFeed(selected["camera"], mirror)
     raise_pending = True
     try:
         while True:
-            if selected["camera"] != opened_index:
-                if capture is not None:
-                    capture.release()
-                try:
-                    capture = open_camera(selected["camera"], 640, 360)
-                except RuntimeError:
-                    capture = None
-                opened_index = selected["camera"]
-                frame = None
-                read_failures = 0
-            if capture is not None:
-                ok, image = capture.read()
-                if ok:
-                    frame = cv2.flip(image, 1) if mirror else image
-                    read_failures = 0
-                else:
-                    read_failures += 1
-                    if read_failures >= 10:
-                        capture.release()
-                        capture = None
-                        frame = None
-            status = ("Waiting for webcam signal..." if capture is not None
-                      else "No signal from this webcam")
+            feed.select(selected["camera"])
+            frame, failed = feed.snapshot()
+            status = "No signal from this webcam" if failed else "Opening webcam..."
             cv2.imshow(LAUNCH_TITLE, _draw_launcher(
                 modes, selected["mode"], selected["camera"], frame, status, layout))
             if raise_pending:
@@ -350,12 +408,12 @@ def choose_launch(modes: tuple[str, ...], mode: str, camera_index: int,
             if selected["start"]:
                 if frame is not None:
                     return selected["mode"], selected["camera"]
-                selected["start"] = False
+                if failed:
+                    selected["start"] = False  # A dead camera cancels the pending start.
             if cv2.getWindowProperty(LAUNCH_TITLE, cv2.WND_PROP_VISIBLE) < 1:
                 return None
     finally:
-        if capture is not None:
-            capture.release()
+        feed.close()
         cv2.destroyWindow(LAUNCH_TITLE)
 
 
@@ -402,6 +460,61 @@ def send_virtual_frame(camera, frame: np.ndarray) -> None:
     if frame.shape[:2] != (camera.height, camera.width):
         frame = cv2.resize(frame, (camera.width, camera.height), interpolation=cv2.INTER_LINEAR)
     camera.send(np.ascontiguousarray(frame))
+
+
+class VideoOutputs:
+    """Where the clean video goes: the virtual camera driver and the optional browser stream."""
+
+    RETRY_SECONDS = 3.0
+
+    def __init__(self, args: argparse.Namespace, resources: ExitStack):
+        self.args = args
+        self.resources = resources
+        self.virtual_camera = None
+        self._attempts = 0
+        self._retry_at: float | None = 0.0
+        self.browser: BrowserOutput | None = None
+        if getattr(args, "browser", False):
+            try:
+                self.browser = BrowserOutput(BROWSER_PORT)
+            except OSError as error:
+                print(f"[Webcam] Browser output unavailable (port {BROWSER_PORT} busy?): {error}")
+            else:
+                resources.callback(self.browser.close)
+                print(f"[Webcam] Browser output on 127.0.0.1:{BROWSER_PORT}; "
+                      "local programs can read this video while VanishCam runs.")
+
+    def send(self, frame: np.ndarray, now: float) -> None:
+        if self._retry_at is not None and now >= self._retry_at:
+            self._open_virtual_camera(frame, now)
+        if self.virtual_camera is not None:
+            send_virtual_frame(self.virtual_camera, frame)
+        if self.browser is not None:
+            self.browser.publish(frame)
+
+    def _open_virtual_camera(self, frame: np.ndarray, now: float) -> None:
+        height, width = frame.shape[:2]
+        self.virtual_camera = open_virtual_camera(self.args, width, height, quiet=self._attempts > 0)
+        self._attempts += 1
+        if self.virtual_camera is not None:
+            self.resources.callback(self.virtual_camera.close)
+            self._retry_at = None
+        elif getattr(self.args, "virtual_camera", None) is None:
+            self._retry_at = now + self.RETRY_SECONDS
+        else:
+            self._retry_at = None
+
+    def badge(self) -> tuple[str, tuple[int, int, int]]:
+        live = []
+        if self.browser is not None and self.browser.connected:
+            live.append("browser stream")
+        if self.virtual_camera is not None:
+            live.append(self.virtual_camera.device)
+        if live:
+            return "Live: " + " + ".join(live), HUD_LIVE
+        if self.browser is not None:
+            return "Waiting for Meet: pick camera 'VanishCam'", HUD_IDLE
+        return "Preview only", HUD_IDLE
 
 
 def download_models(mode: str = "normal") -> None:
@@ -1116,16 +1229,7 @@ def run_camera(args: argparse.Namespace, resources: ExitStack, mode: str) -> int
         return kits[name]
 
     segmenter, recognizer, log_sprite, vanish_sound = load_kit(mode)
-    browser_output = None
-    if getattr(args, "browser", False):
-        try:
-            browser_output = BrowserOutput(BROWSER_PORT)
-        except OSError as error:
-            print(f"[Webcam] Browser output unavailable (port {BROWSER_PORT} busy?): {error}")
-        else:
-            resources.callback(browser_output.close)
-            print(f"[Webcam] Browser output on 127.0.0.1:{BROWSER_PORT}; "
-                  "local programs can read this video while VanishCam runs.")
+    outputs = VideoOutputs(args, resources)
     resources.callback(cv2.destroyAllWindows)
     cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
     cv2.resizeWindow(WINDOW_NAME, args.width, args.height)
@@ -1156,15 +1260,11 @@ def run_camera(args: argparse.Namespace, resources: ExitStack, mode: str) -> int
     goku_delay = getattr(args, "goku_delay", None) or HOLD_SECONDS
     goku_gate = GokuGestureGate(hold_seconds=goku_delay) if mode == "goku" else None
     goku_countdown_remaining: float | None = None
-    virtual_camera = None
-    virtual_camera_attempts = 0
-    virtual_camera_retry_at: float | None = 0.0
     calibration_remaining = None
     last_gesture_report = 0.0
     hud_enabled = getattr(args, "hud", False)
     hud_help = True
     hud_detail = ""
-    previous_now = 0.0
     perf_samples: list[float] = []
     perf_last = perf_report_at = time.monotonic()
     pending_keys: list[int] = []
@@ -1217,21 +1317,9 @@ def run_camera(args: argparse.Namespace, resources: ExitStack, mode: str) -> int
                 raise RuntimeError("The webcam stopped returning frames.")
 
             height, width = camera_frame.shape[:2]
-            if virtual_camera_retry_at is not None and previous_now >= virtual_camera_retry_at:
-                virtual_camera = open_virtual_camera(
-                    args, width, height, quiet=virtual_camera_attempts > 0)
-                virtual_camera_attempts += 1
-                if virtual_camera is not None:
-                    resources.callback(virtual_camera.close)
-                    virtual_camera_retry_at = None
-                elif getattr(args, "virtual_camera", None) is None:
-                    virtual_camera_retry_at = previous_now + 3.0
-                else:
-                    virtual_camera_retry_at = None
             if mode == "normal" and (dissolve_field is None or dissolve_field.shape != (height, width)):
                 dissolve_field, sparkle_noise = make_dissolve_fields(height, width)
             now = time.perf_counter()
-            previous_now = now
 
             timestamp_floor = int((now - started) * 1000)
             mp_image = None
@@ -1444,25 +1532,12 @@ def run_camera(args: argparse.Namespace, resources: ExitStack, mode: str) -> int
                     if state.phase == "vanished":
                         vanished_frame = display
 
-            if virtual_camera is not None:
-                send_virtual_frame(virtual_camera, display)
-            if browser_output is not None:
-                browser_output.publish(display)
+            outputs.send(display, now)
             # Mirror the preview only: video apps expect the camera's true orientation
             # and mirror your self-view themselves.
             preview = display if args.no_mirror else cv2.flip(display, 1)
             if hud_enabled:
-                outputs = []
-                if browser_output is not None and browser_output.connected:
-                    outputs.append("Meet (browser)")
-                if virtual_camera is not None:
-                    outputs.append(virtual_camera.device)
-                if outputs:
-                    vcam_text, vcam_color = "Live: " + " + ".join(outputs), HUD_LIVE
-                elif browser_output is not None:
-                    vcam_text, vcam_color = "Waiting for Meet: pick camera 'VanishCam'", HUD_IDLE
-                else:
-                    vcam_text, vcam_color = "Preview only", HUD_IDLE
+                vcam_text, vcam_color = outputs.badge()
                 preview, hud_targets[:] = draw_hud(
                     preview, mode, ALL_MODES,
                     hud_status(mode, state.phase, calibration_remaining, goku_delay,

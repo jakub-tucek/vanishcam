@@ -63,6 +63,28 @@ a self-made driver would need a paid Apple Developer account.
 5. If Meet later shows a black picture from *OBS Virtual Camera*, restart the Mac once;
    freshly approved camera extensions sometimes need it.
 
+### Optional: shrink OBS to just the driver (~487 MB → ~5 MB)
+
+Once the driver is approved, macOS runs its own copy from `/Library/SystemExtensions/`,
+so OBS's bundled frameworks are no longer needed. If you never use OBS itself, you can
+hollow out the app and keep only what anchors the driver:
+
+```sh
+rm -rf /Applications/OBS.app/Contents/{Frameworks,PlugIns,Resources}
+systemextensionsctl list | grep -i obs   # should still say [activated enabled]
+```
+
+Keep the rest of `OBS.app` (`MacOS/`, `Info.plist`, `embedded.provisionprofile`,
+`_CodeSignature/`, `Library/SystemExtensions/`): macOS removes the driver if the app that
+installed it disappears.
+
+- OBS itself no longer starts; don't open it from Launchpad.
+- Reinstalling or upgrading OBS restores the full app.
+- Tested with OBS 33.0.3 on macOS 26.6: the driver keeps working right after hollowing.
+  Behaviour across a reboot is not verified yet.
+- To undo, or if the driver stops working: `brew reinstall --cask obs`, open OBS, click
+  **Start Virtual Camera** once, quit OBS.
+
 ## Use
 
 1. Run `./vanishcam`. In the **VanishCam** window pick an effect (`1`–`5` or click) and a

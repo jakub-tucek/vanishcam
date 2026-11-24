@@ -39,6 +39,7 @@ from naruto_effect import (
     load_log, overlay_log, render_substitution, substitution_anchor,
 )
 from vanish_sound import SOUND_PATH, TELEPORT_SOUND_PATH, VanishSound
+from browser_output import DEFAULT_PORT as BROWSER_PORT, BrowserOutput
 
 
 APP_DIR = Path(__file__).resolve().parent
@@ -191,6 +192,11 @@ def parse_args() -> argparse.Namespace:
         "--hud", action=argparse.BooleanOptionalAction, default=True,
         help="Status overlay in the preview window only; never sent to the virtual camera",
     )
+    parser.add_argument(
+        "--browser", action=argparse.BooleanOptionalAction, default=True,
+        help="Serve video to the VanishCam browser extension on 127.0.0.1 (default: on)",
+    )
+    parser.add_argument("--browser-port", type=int, default=BROWSER_PORT, help=argparse.SUPPRESS)
     parser.add_argument(
         "--goku-delay", type=positive_seconds, default=None,
         help=f"Goku gesture hold time in seconds (default: {HOLD_SECONDS:g})",
@@ -1101,6 +1107,14 @@ def run_camera(args: argparse.Namespace, resources: ExitStack, mode: str) -> int
         return kits[name]
 
     segmenter, recognizer, log_sprite, vanish_sound = load_kit(mode)
+    browser_output = None
+    if getattr(args, "browser", False):
+        try:
+            browser_output = BrowserOutput(getattr(args, "browser_port", BROWSER_PORT))
+        except OSError as error:
+            print(f"[Webcam] Browser output unavailable (port {args.browser_port} busy?): {error}")
+        else:
+            resources.callback(browser_output.close)
     resources.callback(cv2.destroyAllWindows)
     cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
     cv2.resizeWindow(WINDOW_NAME, args.width, args.height)
@@ -1405,14 +1419,21 @@ def run_camera(args: argparse.Namespace, resources: ExitStack, mode: str) -> int
 
             if virtual_camera is not None:
                 send_virtual_frame(virtual_camera, display)
+            if browser_output is not None:
+                browser_output.publish(display)
             # Mirror the preview only: video apps expect the camera's true orientation
             # and mirror your self-view themselves.
             preview = display if args.no_mirror else cv2.flip(display, 1)
             if hud_enabled:
+                outputs = []
+                if browser_output is not None and browser_output.connected:
+                    outputs.append("Meet (browser)")
                 if virtual_camera is not None:
-                    vcam_text, vcam_color = f"Live: {virtual_camera.device}", HUD_LIVE
-                elif virtual_camera_retry_at is not None:
-                    vcam_text, vcam_color = "Virtual camera busy (quit OBS?)", HUD_WARN
+                    outputs.append(virtual_camera.device)
+                if outputs:
+                    vcam_text, vcam_color = "Live: " + " + ".join(outputs), HUD_LIVE
+                elif browser_output is not None:
+                    vcam_text, vcam_color = "Waiting for Meet: pick camera 'VanishCam'", HUD_IDLE
                 else:
                     vcam_text, vcam_color = "Preview only", HUD_IDLE
                 preview, hud_targets[:] = draw_hud(

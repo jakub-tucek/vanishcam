@@ -12,7 +12,8 @@ direct virtual-camera output, and no Windows/EXE/licensing parts.
 - macOS on Apple Silicon or Intel
 - [Homebrew](https://brew.sh)
 - Python 3.11–3.13 (MediaPipe has no wheels for newer versions yet)
-- For Meet/Zoom: the OBS Virtual Camera driver (installed with OBS Studio)
+- Google Meet: Chrome, Edge, Brave or Arc with the bundled extension (no driver needed)
+- Desktop apps (Zoom app, FaceTime, ...): the OBS Virtual Camera driver, optional
 
 ## Install
 
@@ -32,10 +33,27 @@ macOS asks for **camera access** for your terminal on the first run; allow it in
 
 You can also double-click `VanishCam.command` in Finder.
 
-## Virtual camera for Meet / Zoom (one-time)
+## Google Meet in Chrome, no OBS (one-time)
 
-VanishCam sends its video to the **OBS Virtual Camera** driver. Only the driver is needed;
-the OBS app stays closed while VanishCam runs.
+The `browser-extension/` folder adds a **VanishCam** camera to Google Meet. VanishCam
+serves its video only on `127.0.0.1`, only to `https://meet.google.com`, and only to
+requests from the extension; other websites cannot read it.
+
+1. Open `chrome://extensions`, turn on **Developer mode** (top right).
+2. Click **Load unpacked** and pick the `browser-extension` folder of this repo.
+3. Start `./vanishcam`, open Meet, and choose **Settings → Video → Camera → VanishCam**.
+4. Chrome asks once whether meet.google.com may access apps and services on this device:
+   click **Allow**. (That is how the page reaches VanishCam on `127.0.0.1`.)
+
+Your microphone keeps working as usual. Without the app running, the VanishCam camera shows
+"Start the VanishCam app".
+
+## Desktop apps via the OBS driver (optional, one-time)
+
+For the Zoom desktop app, FaceTime and other native apps, VanishCam also writes to the
+**OBS Virtual Camera** driver when it is installed. Only the driver is needed; the OBS app
+stays closed while VanishCam runs. macOS cannot install that driver without OBS.app, and
+a self-made driver would need a paid Apple Developer account.
 
 1. `brew install --cask obs`
 2. Open OBS and click **Start Virtual Camera** once.
@@ -52,8 +70,9 @@ the OBS app stays closed while VanishCam runs.
 2. Step out of the frame for 4 seconds while the empty background is captured. If you sit
    in a chair, leave the empty chair in place.
 3. Step back in and do the gesture shown at the top of the preview.
-4. In Meet: **Settings → Video → Camera → OBS Virtual Camera**. The badge at the top right
-   of the preview says **Live: OBS Virtual Camera** when frames are flowing.
+4. In Meet pick the camera **VanishCam** (or **OBS Virtual Camera** in desktop apps). The
+   badge at the top right of the preview says **Live: Meet (browser)** or
+   **Live: OBS Virtual Camera** when frames are flowing.
 
 | Key | Effect | Gesture |
 | --- | --- | --- |
@@ -88,7 +107,8 @@ orientation (the preview is mirrored, like a mirror).
 ```sh
 ./vanishcam --mode goku --camera 0   # skip the launcher
 ./vanishcam --goku-delay 1           # Goku hold time in seconds (default 0.3)
-./vanishcam --no-virtual-camera      # preview only
+./vanishcam --no-virtual-camera      # skip the OBS driver
+./vanishcam --no-browser             # don't serve the browser extension
 ./vanishcam --virtual-camera         # exit if the virtual camera is unavailable
 ./vanishcam --no-hud                 # plain preview
 ./vanishcam --no-mirror              # unmirrored preview
@@ -100,9 +120,10 @@ orientation (the preview is mirrored, like a mirror).
 
 | Problem | Fix |
 | --- | --- |
-| Badge says *Virtual camera busy* | Quit OBS (its own virtual camera holds the driver). VanishCam retries every 3 s. |
-| Meet shows black | Select *OBS Virtual Camera* again or reload the tab; fully quit and reopen Chrome; restart the Mac after first installing OBS. |
-| Meet shows the plain webcam | Meet is set to *MacBook Pro Camera*; pick *OBS Virtual Camera*. |
+| No *VanishCam* camera in Meet | Check the extension is enabled in `chrome://extensions`, then reload the Meet tab. |
+| Meet shows "Start the VanishCam app" | Start `./vanishcam`. If it is running, allow meet.google.com to access apps on this device (padlock icon → Site settings → Local network access). |
+| Meet shows the plain webcam | Meet is set to *MacBook Pro Camera*; pick *VanishCam*. |
+| Desktop app shows black from *OBS Virtual Camera* | Quit OBS (its own virtual camera holds the driver); restart the Mac once after first installing OBS. |
 | *Already running* | Another VanishCam window is open; press `Q` there. |
 | *No hand in view* | Hold the gesture higher, around face height, palm towards the camera. |
 | You stay visible after vanishing | Press `Space` and stay fully out of frame for the 4-second capture. |
@@ -117,8 +138,9 @@ orientation (the preview is mirrored, like a mirror).
 ```
 
 Layout: `vanish_cam.py` (app, launcher, overlay), `*_effect.py` (effects),
-`vanish_sound.py`, `mediapipe_log_filter.py` (quiets MediaPipe logs), `models/`,
-`assets/`, `tests/`.
+`vanish_sound.py`, `mediapipe_log_filter.py` (quiets MediaPipe logs), `browser_output.py`
+(localhost frame server) with `browser-extension/` (Meet camera), `models/`, `assets/`,
+`tests/`.
 
 ## Credits
 

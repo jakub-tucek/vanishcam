@@ -46,7 +46,8 @@ APP_DIR = Path(__file__).resolve().parent
 MODEL_DIR = APP_DIR / "models"
 WINDOW_NAME = "Webcam - Preview"
 
-SEGMENTER_MODEL = MODEL_DIR / "selfie_segmenter_landscape.tflite"
+# The square general model; the landscape variant mistakes window frames and bars for people.
+SEGMENTER_MODEL = MODEL_DIR / "selfie_segmenter.tflite"
 GESTURE_MODEL = MODEL_DIR / "gesture_recognizer.task"
 HAND_MODEL = MODEL_DIR / "hand_landmarker.task"
 FACE_MODEL = MODEL_DIR / "blaze_face_short_range.tflite"
@@ -55,8 +56,7 @@ ALL_MODES = ("normal", "naruto", "particles", "goku", "itachi")
 MODEL_URLS = {
     SEGMENTER_MODEL: (
         "https://storage.googleapis.com/mediapipe-models/image_segmenter/"
-        "selfie_segmenter_landscape/float16/latest/"
-        "selfie_segmenter_landscape.tflite"
+        "selfie_segmenter/float16/latest/selfie_segmenter.tflite"
     ),
     GESTURE_MODEL: (
         "https://storage.googleapis.com/mediapipe-models/gesture_recognizer/"
@@ -159,7 +159,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--camera", type=int, default=None,
-        help="Webcam index; if omitted, choose the webcam in the start menu",
+        help="Webcam index (default: last used; C switches cameras while running)",
     )
     parser.add_argument("--width", type=int, default=960, help="Video width")
     parser.add_argument("--height", type=int, default=540, help="Video height")
@@ -182,7 +182,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--virtual-device", help="Name of the virtual device to use")
     parser.add_argument(
         "--mode", choices=ALL_MODES,
-        help="Skip the start menu and launch the chosen mode directly",
+        help="Effect to start with (default: last used; 1-5 switch while running)",
     )
     parser.add_argument(
         "--gesture-debug", action="store_true",
@@ -212,208 +212,106 @@ def set_window_topmost(title: str) -> None:
         pass
 
 
-LAUNCH_TITLE = "VanishCam"
-_PANEL = (26, 29, 34)
-_CARD = (48, 54, 62)
-_BORDER = (111, 142, 153)
-_ACCENT = (255, 200, 80)
-_TEXT = (240, 245, 247)
-_MUTED = (179, 195, 201)
+def camera_names() -> list[str]:
+    """Camera names in OpenCV's index order (AVFoundation's device list), or [] if unknown."""
+    if platform.system() != "Darwin":
+        return []
+    try:
+        import ctypes
+        import ctypes.util
+
+        objc = ctypes.cdll.LoadLibrary(ctypes.util.find_library("objc"))
+        av = ctypes.cdll.LoadLibrary("/System/Library/Frameworks/AVFoundation.framework/AVFoundation")
+        objc.objc_getClass.restype = ctypes.c_void_p
+        objc.objc_getClass.argtypes = [ctypes.c_char_p]
+        objc.sel_registerName.restype = ctypes.c_void_p
+        objc.sel_registerName.argtypes = [ctypes.c_char_p]
+        send = objc.objc_msgSend
+
+        def call(receiver, selector, *args, restype=ctypes.c_void_p, argtypes=()):
+            send.restype = restype
+            send.argtypes = [ctypes.c_void_p, ctypes.c_void_p, *argtypes]
+            return send(receiver, objc.sel_registerName(selector), *args)
+
+        def text(string) -> str:
+            value = call(string, b"UTF8String", restype=ctypes.c_char_p) if string else None
+            return value.decode() if value else ""
+
+        # Mirror OpenCV's orderedVideoCaptureDevices(): video plus muxed devices, sorted by
+        # uniqueID. AVFoundation's own list order changes between processes.
+        devices = []
+        for media_type in ("AVMediaTypeVideo", "AVMediaTypeMuxed"):
+            listed = call(objc.objc_getClass(b"AVCaptureDevice"), b"devicesWithMediaType:",
+                          ctypes.c_void_p.in_dll(av, media_type), argtypes=(ctypes.c_void_p,))
+            for index in range(call(listed, b"count", restype=ctypes.c_ulong)):
+                device = call(listed, b"objectAtIndex:", index, argtypes=(ctypes.c_ulong,))
+                devices.append((text(call(device, b"uniqueID")), text(call(device, b"localizedName"))))
+        return [name or f"Camera {index}" for index, (_, name) in enumerate(sorted(devices))]
+    except (OSError, AttributeError, ValueError):
+        return []
 
 
-def _launch_layout(count: int) -> dict:
-    card_step = 82 if count <= 5 else max(48, 410 // count)
-    return {
-        "cards": [(40, 110 + i * card_step, 420, 110 + i * card_step + card_step - 12)
-                  for i in range(count)],
-        "preview": (450, 110, 1020, 430),
-        "minus": (450, 450, 520, 505),
-        "plus": (620, 450, 690, 505),
-        "start": (790, 450, 1020, 505),
-    }
+def is_virtual_camera(name: str) -> bool:
+    """VanishCam's own output (OBS Virtual Camera) must never become its input."""
+    return "virtual" in name.lower()
 
 
-def _inside(box: tuple[int, int, int, int], x: int, y: int) -> bool:
-    return box[0] <= x <= box[2] and box[1] <= y <= box[3]
+class CameraSwitcher:
+    """Finds the next working camera on a background thread.
 
-
-def _draw_launcher(modes, mode, camera_index, frame, status, layout) -> np.ndarray:
-    window = np.full((570, 1060, 3), _PANEL, np.uint8)
-    font = cv2.FONT_HERSHEY_SIMPLEX
-    cv2.putText(window, "VANISHCAM", (40, 62), font, 1.0, _TEXT, 2, cv2.LINE_AA)
-    cv2.putText(window, "Pick an effect and a camera, then press ENTER", (40, 90),
-                font, 0.5, _MUTED, 1, cv2.LINE_AA)
-    for index, (name, (left, top, right, bottom)) in enumerate(zip(modes, layout["cards"]), 1):
-        active = name == mode
-        cv2.rectangle(window, (left, top), (right, bottom), (70, 80, 92) if active else _CARD, -1)
-        cv2.rectangle(window, (left, top), (right, bottom), _ACCENT if active else _BORDER,
-                      3 if active else 1, cv2.LINE_AA)
-        title, detail = MODE_LABELS[name]
-        cv2.putText(window, f"{index}  {title.upper()}", (left + 18, top + 30),
-                    font, 0.7, _TEXT, 2, cv2.LINE_AA)
-        cv2.putText(window, detail, (left + 18, top + 55), font, 0.47, _MUTED, 1, cv2.LINE_AA)
-
-    left, top, right, bottom = layout["preview"]
-    if frame is not None:
-        window[top:bottom, left:right] = cv2.resize(frame, (right - left, bottom - top))
-    else:
-        cv2.putText(window, status, (left + 120, (top + bottom) // 2), font, 0.65,
-                    _MUTED, 2, cv2.LINE_AA)
-    cv2.rectangle(window, (left - 1, top - 1), (right, bottom), _BORDER, 1)
-
-    for key, label in (("minus", "-"), ("plus", "+")):
-        x0, y0, x1, y1 = layout[key]
-        cv2.rectangle(window, (x0, y0), (x1, y1), _CARD, -1)
-        cv2.rectangle(window, (x0, y0), (x1, y1), _BORDER, 1)
-        cv2.putText(window, label, (x0 + 25, y0 + 38), font, 1.0, _TEXT, 2, cv2.LINE_AA)
-    cv2.putText(window, f"CAM {camera_index}", (532, 486), font, 0.6, _TEXT, 2, cv2.LINE_AA)
-    x0, y0, x1, y1 = layout["start"]
-    ready = frame is not None
-    cv2.rectangle(window, (x0, y0), (x1, y1), (78, 132, 124) if ready else _CARD, -1)
-    cv2.putText(window, "START  (ENTER)", (x0 + 32, y0 + 36), font, 0.62,
-                _TEXT if ready else _MUTED, 2, cv2.LINE_AA)
-    cv2.putText(window, f"1-{len(modes)} effect     A / D camera     ENTER start     Q quit",
-                (40, 548), font, 0.5, _MUTED, 1, cv2.LINE_AA)
-    return window
-
-
-class CameraFeed:
-    """Opens and reads one webcam on a background thread.
-
-    Opening a missing camera index can block AVFoundation for seconds; doing it here
-    keeps the launcher window responsive while the user flips through cameras.
+    Opening a missing camera index can block AVFoundation for seconds, so the preview keeps
+    running on the current camera until a working one has delivered a frame.
     """
 
-    MAX_READ_FAILURES = 10
+    MAX_INDEX = 9
 
-    def __init__(self, index: int, mirror: bool):
-        self._mirror = mirror
+    def __init__(self, width: int, height: int, names: list[str] | None = None):
+        self._size = (width, height)
+        self.names = names or []
         self._lock = threading.Lock()
-        self._wanted = index
-        self._frame: np.ndarray | None = None
-        self._failed = False
-        self._stop = threading.Event()
-        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread: threading.Thread | None = None
+        self._result: tuple[int | None, cv2.VideoCapture | None] | None = None
+
+    def label(self, index: int) -> str:
+        if self.searching:
+            return "searching..."
+        return self.names[index] if index < len(self.names) else str(index)
+
+    @property
+    def searching(self) -> bool:
+        return self._thread is not None and self._thread.is_alive()
+
+    def start(self, current: int) -> None:
+        if self.searching:
+            return
+        self._result = None
+        count = len(self.names) or self.MAX_INDEX + 1
+        candidates = [index % count for index in range(current + 1, current + count)]
+        if self.names:
+            candidates = [index for index in candidates if not is_virtual_camera(self.names[index])]
+        self._thread = threading.Thread(target=self._search, args=(candidates,), daemon=True)
         self._thread.start()
 
-    def select(self, index: int) -> None:
+    def poll(self) -> tuple[int | None, cv2.VideoCapture | None] | None:
+        """(index, capture) once the search ends; (None, None) if no other camera works."""
         with self._lock:
-            if index != self._wanted:
-                self._wanted, self._frame, self._failed = index, None, False
+            result, self._result = self._result, None
+        return result
 
-    def snapshot(self) -> tuple[np.ndarray | None, bool]:
+    def _search(self, candidates: list[int]) -> None:
+        found: tuple[int | None, cv2.VideoCapture | None] = (None, None)
+        for index in candidates:
+            try:
+                capture = open_camera(index, *self._size)
+            except RuntimeError:
+                continue
+            ok = any(capture.read()[0] for _ in range(10))
+            if ok:
+                found = (index, capture)
+                break
+            capture.release()
         with self._lock:
-            return self._frame, self._failed
-
-    def close(self) -> None:
-        self._stop.set()
-        self._thread.join(timeout=5)
-
-    def _run(self) -> None:
-        capture = None
-        opened = None
-        failures = 0
-        try:
-            while not self._stop.is_set():
-                with self._lock:
-                    wanted = self._wanted
-                if wanted != opened:
-                    if capture is not None:
-                        capture.release()
-                    opened, failures = wanted, 0
-                    try:
-                        capture = open_camera(wanted, 640, 360)
-                    except RuntimeError:
-                        capture = None
-                        self._mark_failed(wanted)
-                    continue
-                if capture is None:
-                    self._stop.wait(0.05)
-                    continue
-                ok, image = capture.read()
-                if ok:
-                    failures = 0
-                    self._publish(wanted, cv2.flip(image, 1) if self._mirror else image)
-                else:
-                    failures += 1
-                    if failures >= self.MAX_READ_FAILURES:
-                        capture.release()
-                        capture = None
-                        self._mark_failed(wanted)
-                    else:
-                        self._stop.wait(0.03)
-        finally:
-            if capture is not None:
-                capture.release()
-
-    def _publish(self, index: int, frame: np.ndarray) -> None:
-        with self._lock:
-            if index == self._wanted:
-                self._frame, self._failed = frame, False
-
-    def _mark_failed(self, index: int) -> None:
-        with self._lock:
-            if index == self._wanted:
-                self._frame, self._failed = None, True
-
-
-def choose_launch(modes: tuple[str, ...], mode: str, camera_index: int,
-                  mirror: bool = True) -> tuple[str, int] | None:
-    """One window: effect cards plus a live preview of the selected webcam."""
-    layout = _launch_layout(len(modes))
-    selected = {"mode": mode if mode in modes else modes[0],
-                "camera": max(0, min(9, camera_index)), "start": False}
-
-    def on_mouse(event, x, y, flags, userdata):
-        if event != cv2.EVENT_LBUTTONUP:
-            return
-        for name, box in zip(modes, layout["cards"]):
-            if _inside(box, x, y):
-                selected["mode"] = name
-        if _inside(layout["minus"], x, y):
-            selected["camera"] = max(0, selected["camera"] - 1)
-        elif _inside(layout["plus"], x, y):
-            selected["camera"] = min(9, selected["camera"] + 1)
-        elif _inside(layout["start"], x, y):
-            selected["start"] = True
-
-    print(f"[Menu] Choose an effect and webcam in the '{LAUNCH_TITLE}' window.", flush=True)
-    cv2.namedWindow(LAUNCH_TITLE, cv2.WINDOW_AUTOSIZE)
-    cv2.setMouseCallback(LAUNCH_TITLE, on_mouse)
-    feed = CameraFeed(selected["camera"], mirror)
-    raise_pending = True
-    try:
-        while True:
-            feed.select(selected["camera"])
-            frame, failed = feed.snapshot()
-            status = "No signal from this webcam" if failed else "Opening webcam..."
-            cv2.imshow(LAUNCH_TITLE, _draw_launcher(
-                modes, selected["mode"], selected["camera"], frame, status, layout))
-            if raise_pending:
-                set_window_topmost(LAUNCH_TITLE)
-                raise_pending = False
-
-            key = cv2.waitKey(30) & 0xFF
-            if ord("1") <= key < ord("1") + len(modes):
-                selected["mode"] = modes[key - ord("1")]
-            elif key in (ord("a"), ord("A")):
-                selected["camera"] = max(0, selected["camera"] - 1)
-            elif key in (ord("d"), ord("D")):
-                selected["camera"] = min(9, selected["camera"] + 1)
-            elif key in (10, 13):
-                selected["start"] = True
-            elif key in (ord("q"), 27):
-                return None
-            if selected["start"]:
-                if frame is not None:
-                    return selected["mode"], selected["camera"]
-                if failed:
-                    selected["start"] = False  # A dead camera cancels the pending start.
-            if cv2.getWindowProperty(LAUNCH_TITLE, cv2.WND_PROP_VISIBLE) < 1:
-                return None
-    finally:
-        feed.close()
-        cv2.destroyWindow(LAUNCH_TITLE)
+            self._result = found
 
 
 def virtual_camera_required(args: argparse.Namespace) -> bool:
@@ -698,7 +596,40 @@ def person_mask(
     raw = np.squeeze(result.confidence_masks[0].numpy_view()).astype(np.float32)
     resized = cv2.resize(raw, (width, height), interpolation=cv2.INTER_LINEAR)
     resized = cv2.GaussianBlur(resized, (0, 0), sigmaX=2.2, sigmaY=2.2)
-    return np.clip((resized - 0.12) / 0.68, 0.0, 1.0)
+    return keep_person_regions(np.clip((resized - 0.12) / 0.68, 0.0, 1.0))
+
+
+def keep_person_regions(mask: np.ndarray, min_share: float = 0.15) -> np.ndarray:
+    """Drop small detached blobs (a lamp, a door frame) the segmenter mistakes for a person.
+
+    Regions at least min_share of the largest one survive, so two people both stay.
+    """
+    height, width = mask.shape[:2]
+    small_width = min(width, 320)
+    small = cv2.resize(mask, (small_width, max(1, round(height * small_width / width))),
+                       interpolation=cv2.INTER_AREA)
+    count, labels, stats, _ = cv2.connectedComponentsWithStats(
+        (small > 0.5).astype(np.uint8), connectivity=8)
+    if count <= 2:
+        return mask
+    areas = stats[1:, cv2.CC_STAT_AREA]
+    keep = np.zeros(count, np.float32)
+    keep[1:] = areas >= areas.max() * min_share
+    region = cv2.dilate(keep[labels], np.ones((9, 9), np.uint8))
+    return mask * cv2.resize(region, (width, height), interpolation=cv2.INTER_LINEAR)
+
+
+def refine_mask_edges(mask: np.ndarray, frame: np.ndarray) -> np.ndarray:
+    """Snap the mask to real edges (hair, glasses, ears) with a guided filter at 640 px."""
+    height, width = mask.shape[:2]
+    small_width = min(width, 640)
+    size = (small_width, max(1, round(height * small_width / width)))
+    guide = cv2.resize(frame, size, interpolation=cv2.INTER_AREA)
+    small = cv2.resize(mask, size, interpolation=cv2.INTER_AREA)
+    refined = cv2.ximgproc.guidedFilter(guide, small, 6, 1e-3)
+    if size != (width, height):
+        refined = cv2.resize(refined, (width, height), interpolation=cv2.INTER_LINEAR)
+    return np.clip(refined, 0.0, 1.0)
 
 
 LIVE_VANISH_MODES = frozenset(("normal", "particles", "goku"))
@@ -784,7 +715,7 @@ class BackgroundStyle:
     still draw their smoke, crows and particles on top of the chosen background.
     """
 
-    MASK_INTERVAL = 0.05
+    MASK_INTERVAL = 1 / 30
 
     def __init__(self, images: list[Path], choice: str = "off"):
         self.choices = ["off", "blur", *(str(path) for path in images)]
@@ -816,10 +747,11 @@ class BackgroundStyle:
     def mask_due(self, now: float) -> bool:
         return self.enabled and now - self._mask_at >= self.MASK_INTERVAL
 
-    def update_mask(self, mask: np.ndarray, now: float) -> None:
-        crisp = smoothstep(0.25, 0.75, mask).astype(np.float32)
-        same_shape = self._mask is not None and self._mask.shape == crisp.shape
-        self._mask = crisp * 0.6 + self._mask * 0.4 if same_shape else crisp
+    def update_mask(self, mask: np.ndarray, now: float, frame: np.ndarray | None = None) -> None:
+        refined = refine_mask_edges(mask, frame) if frame is not None else mask
+        same_shape = self._mask is not None and self._mask.shape == refined.shape
+        # Mostly the newest mask: heavier smoothing lags behind head turns and cuts the face.
+        self._mask = refined * 0.8 + self._mask * 0.2 if same_shape else refined
         self._mask_at = now
 
     def _backdrop(self, frame: np.ndarray) -> np.ndarray:
@@ -1181,8 +1113,9 @@ def _hud_box(image, x0, y0, x1, y1, color=None) -> None:
 
 
 HUD_HELP_ITEMS = (
-    ("V vanish", "v"), ("R reappear", "r"), ("SPACE new background", " "),
-    ("B background", "b"), ("F fullscreen", "f"), ("H hide help", "h"), ("Q quit", "q"),
+    ("V vanish", "v"), ("R reappear", "r"), ("SPACE recapture room", " "),
+    ("B background", "b"), ("C camera", "c"), ("F fullscreen", "f"), ("H hide help", "h"),
+    ("Q quit", "q"),
 )
 
 
@@ -1199,7 +1132,7 @@ def _hud_button(image, label, x, top, bottom, scale, active=False) -> tuple[int,
 
 def draw_hud(frame: np.ndarray, mode: str, modes: tuple[str, ...], status: str, detail: str,
              vcam_text: str, vcam_color: tuple[int, int, int], show_help: bool,
-             background_label: str = "off",
+             button_values: dict[str, str] | None = None,
              ) -> tuple[np.ndarray, list[tuple[tuple[int, int, int, int], int]]]:
     """Preview-only overlay plus its click targets; the virtual camera gets the clean frame."""
     image = frame.copy()
@@ -1239,8 +1172,8 @@ def draw_hud(frame: np.ndarray, mode: str, modes: tuple[str, ...], status: str, 
     for label, key in items:
         if mode == "goku" and key in "vr":
             continue
-        if key == "b":
-            label = f"{label}: {background_label}"
+        if button_values and key in button_values:
+            label = f"{label}: {button_values[key]}"
         box = _hud_button(image, label, x, top, bottom, scale)
         targets.append((box, ord(key)))
         x = box[2] + gap
@@ -1306,24 +1239,16 @@ def run() -> int:
     args = parse_args()
     if getattr(args, "self_test", False):
         return self_test()
-    mode = args.mode
-    if mode is None or args.camera is None:
-        settings = load_settings()
-        remembered_mode = settings.get("mode")
+    needs_settings = args.mode is None or args.camera is None or (
+        hasattr(args, "background") and args.background is None)
+    settings = load_settings() if needs_settings else {}
+    mode = args.mode or (settings.get("mode") if settings.get("mode") in ALL_MODES else "normal")
+    if args.camera is None:
         remembered_camera = settings.get("camera")
-        picked = choose_launch(
-            ALL_MODES,
-            mode or (remembered_mode if remembered_mode in ALL_MODES else ALL_MODES[0]),
-            args.camera if args.camera is not None else
-            (remembered_camera if isinstance(remembered_camera, int) else 0),
-            mirror=not args.no_mirror,
-        )
-        if picked is None:
-            return 0
-        mode, args.camera = picked
-        save_settings(mode=mode, camera=args.camera)
+        args.camera = remembered_camera if isinstance(remembered_camera, int) and \
+            0 <= remembered_camera <= CameraSwitcher.MAX_INDEX else 0
     if hasattr(args, "background") and args.background is None:
-        remembered = load_settings().get("background")
+        remembered = settings.get("background")
         if remembered in ("off", "blur") or (isinstance(remembered, str)
                                              and find_background_image(remembered)):
             args.background = remembered
@@ -1333,9 +1258,24 @@ def run() -> int:
 
 def run_camera(args: argparse.Namespace, resources: ExitStack, mode: str) -> int:
     download_models(mode)
-    capture = open_camera(args.camera, args.width, args.height)
-    resources.callback(capture.release)
+    names = camera_names()
+    if args.camera < len(names) and is_virtual_camera(names[args.camera]):
+        real = [index for index, name in enumerate(names) if not is_virtual_camera(name)]
+        if real:
+            print(f"[Webcam] Camera {args.camera} is {names[args.camera]} (VanishCam's own "
+                  f"output); using {names[real[0]]} instead.")
+            args.camera = real[0]
+    try:
+        capture = open_camera(args.camera, args.width, args.height)
+    except RuntimeError:
+        if args.camera == 0:
+            raise
+        print(f"[Webcam] Camera {args.camera} unavailable; using camera 0.")
+        args.camera = 0
+        capture = open_camera(0, args.width, args.height)
+    resources.callback(lambda: capture.release())
     capture.set(cv2.CAP_PROP_FPS, args.fps)
+    switcher = CameraSwitcher(args.width, args.height, names)
     kits: dict[str, tuple] = {}
 
     def load_kit(name: str) -> tuple:
@@ -1389,6 +1329,7 @@ def run_camera(args: argparse.Namespace, resources: ExitStack, mode: str) -> int
     hud_enabled = getattr(args, "hud", False)
     hud_help = True
     hud_detail = ""
+    previous_now = 0.0
     perf_samples: list[float] = []
     perf_last = perf_report_at = time.monotonic()
     pending_keys: list[int] = []
@@ -1430,12 +1371,30 @@ def run_camera(args: argparse.Namespace, resources: ExitStack, mode: str) -> int
 
     started = time.perf_counter()
     print("[Webcam] Step out of the frame for 4 seconds: capturing the background.")
-    print("[Webcam] Keys in the preview window: 1-5 effect, SPACE new background, "
-          "R reappear, V vanish, B blur/background, F fullscreen, H help, Q quit.")
+    print("[Webcam] Keys in the preview window: 1-5 effect, SPACE recapture room, "
+          "R reappear, V vanish, B background, C camera, F fullscreen, H help, Q quit.")
 
     raise_pending = True
     try:
         while True:
+            switched = switcher.poll()
+            if switched is not None:
+                index, new_capture = switched
+                if new_capture is None:
+                    print("[Webcam] No other working camera found.")
+                else:
+                    capture.release()
+                    capture, args.camera = new_capture, index
+                    capture.set(cv2.CAP_PROP_FPS, args.fps)
+                    save_settings(camera=index)
+                    reset_effect()
+                    background = None
+                    background_samples.clear()
+                    calibration_remaining = None
+                    state.phase = "calibrating"
+                    state.calibration_started = previous_now
+                    print(f"[Webcam] Camera {switcher.label(index)}. "
+                          "Step out of the frame: capturing the background.")
             ok, camera_frame = capture.read()
             if not ok:
                 raise RuntimeError("The webcam stopped returning frames.")
@@ -1445,12 +1404,14 @@ def run_camera(args: argparse.Namespace, resources: ExitStack, mode: str) -> int
                 dissolve_field, sparkle_noise = make_dissolve_fields(height, width)
             now = time.perf_counter()
 
+            previous_now = now
             timestamp_floor = int((now - started) * 1000)
             mp_image = None
             person_visible = state.phase != "vanished"
             if person_visible and style.mask_due(now):
                 mp_image = to_mp_image(camera_frame)
-                style.update_mask(person_mask(segmenter, mp_image, stamp(), width, height), now)
+                style.update_mask(person_mask(segmenter, mp_image, stamp(), width, height), now,
+                                  camera_frame)
             # Effects render on the styled scene and plate; recognition and the background
             # capture keep using the raw camera frame.
             scene_frame = style.scene(camera_frame, person_visible)
@@ -1676,7 +1637,8 @@ def run_camera(args: argparse.Namespace, resources: ExitStack, mode: str) -> int
                                goku_countdown_remaining),
                     hud_detail if state.phase == "ready" or (
                         state.phase == "vanished" and mode in ("goku", "itachi")) else "",
-                    vcam_text, vcam_color, hud_help, style.label,
+                    vcam_text, vcam_color, hud_help,
+                    {"b": style.label, "c": switcher.label(args.camera)},
                 )
             cv2.imshow(WINDOW_NAME, preview)
             if raise_pending:
@@ -1692,6 +1654,7 @@ def run_camera(args: argparse.Namespace, resources: ExitStack, mode: str) -> int
                 break
             if ord("1") <= key < ord("1") + len(ALL_MODES) and ALL_MODES[key - ord("1")] != mode:
                 mode = ALL_MODES[key - ord("1")]
+                save_settings(mode=mode)
                 print(f"[Webcam] Effect: {MODE_LABELS[mode][0]}")
                 download_models(mode)
                 segmenter, recognizer, log_sprite, vanish_sound = load_kit(mode)
@@ -1702,6 +1665,10 @@ def run_camera(args: argparse.Namespace, resources: ExitStack, mode: str) -> int
                     state.phase = "ready"
             elif key in (ord("h"), ord("H")):
                 hud_help = not hud_help
+            elif key in (ord("c"), ord("C")):
+                if not switcher.searching:
+                    print("[Webcam] Looking for the next camera...")
+                switcher.start(args.camera)
             elif key in (ord("b"), ord("B")):
                 style.cycle()
                 save_settings(background=style.choice)

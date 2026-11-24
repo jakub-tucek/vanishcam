@@ -1,12 +1,11 @@
 import argparse
-import threading
 import time
 import unittest
 from contextlib import ExitStack
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
-from unittest.mock import Mock, call, patch
+from unittest.mock import Mock, patch
 
 import numpy as np
 
@@ -80,118 +79,105 @@ class VirtualCameraTests(unittest.TestCase):
         self.assertTrue((sent == 42).all())
 
 
-class LauncherTests(unittest.TestCase):
-    """The preview camera opens on a background thread, so keys are fed with small pauses
-    and the launcher may need several idle iterations before a frame arrives."""
-
-    def launch(self, keys, cameras, mode="normal", camera_index=0):
-        pending = list(keys)
-        calls = [0]
-
-        def wait_key(delay):
-            calls[0] += 1
-            if calls[0] > 2000:
-                raise AssertionError("launcher never finished")
-            time.sleep(0.005)
-            return pending.pop(0) if pending else 255
-
-        with patch.object(app, "open_camera", side_effect=cameras) as opening, \
-             patch.object(app.cv2, "namedWindow"), \
-             patch.object(app.cv2, "setMouseCallback"), \
-             patch.object(app.cv2, "imshow"), \
-             patch.object(app.cv2, "destroyWindow"), \
-             patch.object(app.cv2, "getWindowProperty", return_value=1), \
-             patch.object(app.cv2, "waitKey", side_effect=wait_key):
-            result = app.choose_launch(app.ALL_MODES, mode, camera_index)
-        return result, opening
+class CameraSwitcherTests(unittest.TestCase):
+    def wait(self, switcher):
+        for _ in range(200):
+            result = switcher.poll()
+            if result is not None:
+                return result
+            time.sleep(0.01)
+        raise AssertionError("camera search never finished")
 
     @staticmethod
-    def camera(first_reads=()):
-        reads = list(first_reads)
-        frame = np.zeros((24, 40, 3), np.uint8)
+    def camera(works=True):
         camera = Mock()
-        camera.read.side_effect = lambda: reads.pop(0) if reads else (True, frame)
+        camera.read.return_value = (works, np.zeros((24, 40, 3), np.uint8) if works else None)
         return camera
 
-    def test_keys_pick_effect_and_switch_camera_preview(self):
-        cameras = [self.camera(), self.camera()]
-        result, opening = self.launch((ord("4"), ord("d"), 13), cameras)
-        self.assertEqual(result, ("goku", 1))
-        self.assertEqual(opening.call_args, call(1, 640, 360))
-        for camera in cameras[:opening.call_count]:
-            camera.release.assert_called_once()
+    def test_skips_missing_and_dead_cameras(self):
+        dead, alive = self.camera(works=False), self.camera()
+        opened = {1: RuntimeError("missing"), 2: dead, 3: alive}
 
-    def test_every_effect_has_a_number_key(self):
-        for index, mode in enumerate(app.ALL_MODES, 1):
-            result, _ = self.launch((ord(str(index)), 13), [self.camera()])
-            self.assertEqual(result, (mode, 0))
+        def open_camera(index, width, height):
+            result = opened.get(index, RuntimeError("missing"))
+            if isinstance(result, Exception):
+                raise result
+            return result
 
-    def test_starts_with_remembered_choice(self):
-        result, opening = self.launch((13,), [self.camera()], mode="itachi", camera_index=2)
-        self.assertEqual(result, ("itachi", 2))
-        opening.assert_called_once_with(2, 640, 360)
+        with patch.object(app, "open_camera", side_effect=open_camera) as opening:
+            switcher = app.CameraSwitcher(640, 360)
+            switcher.start(0)
+            self.assertEqual(self.wait(switcher), (3, alive))
+        self.assertEqual([c.args[0] for c in opening.call_args_list], [1, 2, 3])
+        dead.release.assert_called_once()
+        alive.release.assert_not_called()
 
-    def test_dead_camera_cancels_start_until_a_working_one_is_picked(self):
-        camera = self.camera()
-        keys = (13,) + (255,) * 20 + (ord("d"), 13)
-        result, _ = self.launch(keys, (RuntimeError("missing"), camera))
-        self.assertEqual(result, ("normal", 1))
-        camera.release.assert_called_once()
+    def test_wraps_around_and_reports_when_nothing_else_works(self):
+        with patch.object(app, "open_camera", side_effect=RuntimeError("missing")) as opening:
+            switcher = app.CameraSwitcher(640, 360)
+            switcher.start(8)
+            self.assertEqual(self.wait(switcher), (None, None))
+        self.assertEqual([c.args[0] for c in opening.call_args_list], [9, 0, 1, 2, 3, 4, 5, 6, 7])
 
-    def test_enter_waits_for_first_preview_frame(self):
-        camera = self.camera([(False, None)] * 3)
-        result, _ = self.launch((13,), [camera])
-        self.assertEqual(result, ("normal", 0))
-        self.assertGreaterEqual(camera.read.call_count, 4)
+    def test_known_names_skip_virtual_cameras_and_missing_indexes(self):
+        names = ["MacBook Pro Camera", "OBS Virtual Camera", "Studio Display Camera"]
+        with patch.object(app, "open_camera", return_value=self.camera()) as opening:
+            switcher = app.CameraSwitcher(640, 360, names)
+            switcher.start(0)
+            self.assertEqual(self.wait(switcher)[0], 2)
+            switcher.start(2)
+            self.assertEqual(self.wait(switcher)[0], 0)
+        self.assertEqual([c.args[0] for c in opening.call_args_list], [2, 0])
+        self.assertEqual(switcher.label(2), "Studio Display Camera")
 
-    def test_slow_camera_does_not_block_the_window(self):
-        opened = threading.Event()
+    def test_only_camera_reports_nothing_else(self):
+        with patch.object(app, "open_camera") as opening:
+            switcher = app.CameraSwitcher(640, 360, ["MacBook Pro Camera", "OBS Virtual Camera"])
+            switcher.start(0)
+            self.assertEqual(self.wait(switcher), (None, None))
+        opening.assert_not_called()
 
+    def test_slow_open_does_not_block_the_caller(self):
         def slow_open(index, width, height):
-            time.sleep(0.5)
-            opened.set()
+            time.sleep(0.3)
             return self.camera()
 
-        drawn_before_open = []
-        with patch.object(app, "_draw_launcher", side_effect=lambda *a: drawn_before_open.append(
-                not opened.is_set()) or np.zeros((10, 10, 3), np.uint8)):
-            result, _ = self.launch((13,), slow_open)
-        self.assertEqual(result, ("normal", 0))
-        self.assertGreater(sum(drawn_before_open), 5)
-
-    def test_quit_returns_nothing(self):
-        result, _ = self.launch((ord("q"),), [self.camera()])
-        self.assertIsNone(result)
-
-    def test_launcher_text_fits_its_boxes(self):
-        layout = app._launch_layout(len(app.ALL_MODES))
-        for left, _, right, _ in layout["cards"]:
-            for title, detail in app.MODE_LABELS.values():
-                for text, scale, thickness in ((f"5  {title.upper()}", 0.7, 2), (detail, 0.47, 1)):
-                    (width, _), _ = app.cv2.getTextSize(text, app.cv2.FONT_HERSHEY_SIMPLEX, scale, thickness)
-                    self.assertLessEqual(left + 18 + width, right, text)
+        with patch.object(app, "open_camera", side_effect=slow_open):
+            switcher = app.CameraSwitcher(640, 360)
+            started = time.perf_counter()
+            switcher.start(0)
+            self.assertLess(time.perf_counter() - started, 0.05)
+            self.assertTrue(switcher.searching)
+            self.assertIsNone(switcher.poll())
+            self.assertEqual(self.wait(switcher)[0], 1)
 
 
 class RunTests(unittest.TestCase):
-    def test_mode_and_camera_on_command_line_skip_the_launcher(self):
+    def test_command_line_effect_and_camera_skip_saved_settings(self):
         with patch.object(app, "parse_args", return_value=arguments(mode="naruto")), \
-             patch.object(app, "choose_launch") as launcher, \
+             patch.object(app, "load_settings") as settings, \
              patch.object(app, "run_camera", return_value=0) as camera:
             self.assertEqual(app.run(), 0)
-        launcher.assert_not_called()
+        settings.assert_not_called()
         self.assertEqual(camera.call_args.args[2], "naruto")
 
-    def test_launcher_choice_is_used_and_remembered(self):
+    def test_starts_live_with_remembered_effect_and_camera(self):
         args = arguments(mode=None, camera=None)
         with patch.object(app, "parse_args", return_value=args), \
              patch.object(app, "load_settings", return_value={"mode": "particles", "camera": 3}), \
-             patch.object(app, "save_settings") as save, \
-             patch.object(app, "choose_launch", return_value=("goku", 2)) as launcher, \
              patch.object(app, "run_camera", return_value=0) as camera:
             self.assertEqual(app.run(), 0)
-        launcher.assert_called_once_with(app.ALL_MODES, "particles", 3, mirror=False)
-        save.assert_called_once_with(mode="goku", camera=2)
-        self.assertEqual(camera.call_args.args[0].camera, 2)
+        self.assertEqual(camera.call_args.args[2], "particles")
+        self.assertEqual(camera.call_args.args[0].camera, 3)
+
+    def test_first_start_defaults_to_normal_on_camera_zero(self):
+        args = arguments(mode=None, camera=None)
+        with patch.object(app, "parse_args", return_value=args), \
+             patch.object(app, "load_settings", return_value={"mode": "bogus", "camera": 42}), \
+             patch.object(app, "run_camera", return_value=0) as camera:
+            self.assertEqual(app.run(), 0)
+        self.assertEqual(camera.call_args.args[2], "normal")
+        self.assertEqual(camera.call_args.args[0].camera, 0)
 
 
 class VideoOutputsTests(unittest.TestCase):
@@ -243,6 +229,7 @@ class LoopControlTests(unittest.TestCase):
         mask[20:70, 40:80] = 1.0
         with ExitStack() as mocks:
             mocks.enter_context(patch.object(app, "download_models"))
+            mocks.enter_context(patch.object(app, "save_settings"))
             mocks.enter_context(patch.object(app, "open_camera", return_value=capture))
             tasks = mocks.enter_context(patch.object(app, "create_tasks", return_value=(Mock(), recognizer)))
             mocks.enter_context(patch.object(app, "open_virtual_camera", return_value=None))
@@ -285,6 +272,11 @@ class LoopControlTests(unittest.TestCase):
         self.assertEqual([c.args[0] for c in tasks.call_args_list], ["normal", "naruto"])
         self.assertIn("[Webcam] Effect: Naruto", messages)
 
+    def test_never_starts_on_its_own_virtual_camera(self):
+        names = patch.object(app, "camera_names", return_value=["OBS Virtual Camera", "MacBook Pro Camera"])
+        _, messages = self.run_loop("normal", (0.1, 0.2), (0, ord("q")), extra=(names,))
+        self.assertTrue(any("using MacBook Pro Camera instead" in m for m in messages))
+
     def test_switching_during_background_capture_keeps_capturing(self):
         times = (0.1, 4.1, 4.3, 4.5) + tuple(4.9 + i * 0.4 for i in range(10))
         keys = [0] * len(times)
@@ -307,6 +299,25 @@ class BackgroundStyleTests(unittest.TestCase):
         style = app.BackgroundStyle(list(images), choice)
         style.update_mask(self.mask, 0.0)
         return style
+
+    def test_small_detached_blobs_are_dropped_but_a_second_person_stays(self):
+        mask = np.zeros((180, 320), np.float32)
+        mask[40:180, 120:200] = 1.0   # The person.
+        mask[10:25, 260:300] = 1.0    # A lamp misread as a person.
+        mask[60:180, 10:70] = 1.0     # A second person, about half the size.
+        cleaned = app.keep_person_regions(mask)
+        self.assertEqual(cleaned[100, 160], 1.0)
+        self.assertEqual(cleaned[17, 280], 0.0)
+        self.assertEqual(cleaned[120, 40], 1.0)
+
+    def test_edge_refinement_follows_the_image(self):
+        frame = np.zeros((90, 160, 3), np.uint8)
+        frame[:, 80:] = 255            # A hard edge at x=80.
+        rough = np.zeros((90, 160), np.float32)
+        rough[:, 70:] = 1.0            # The mask overshoots by 10 px.
+        refined = app.refine_mask_edges(rough, frame)
+        self.assertLess(refined[45, 72], rough[45, 72] - 0.3)
+        self.assertGreater(refined[45, 120], 0.9)
 
     def test_off_returns_the_frame_untouched(self):
         style = self.style("off")

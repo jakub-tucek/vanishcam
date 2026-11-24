@@ -4,7 +4,7 @@ Vanish from your webcam with a hand gesture, live in Google Meet, Zoom or any ap
 uses a camera. Video is processed locally; nothing is recorded or uploaded.
 
 macOS fork of [Nicovic17/vanish_webcam](https://github.com/Nicovic17/vanish_webcam):
-English UI, one-window launcher, live effect switching, preview-only status overlay,
+English UI, everything switchable live (effect, camera, background), preview-only overlay,
 direct virtual-camera output, and no Windows/EXE/licensing parts.
 
 ## Requirements
@@ -72,8 +72,8 @@ installed it disappears.
 
 ## Use
 
-1. Run `./vanishcam`. In the **VanishCam** window pick an effect (`1`–`5` or click) and a
-   webcam (`A`/`D` or `-`/`+`), then press **Enter**. The choice is remembered.
+1. Run `./vanishcam`. The preview opens straight away with your last effect, camera and
+   background (Normal on the built-in camera the first time). Change any of them live.
 2. Step out of the frame for 4 seconds while the empty background is captured. If you sit
    in a chair, leave the empty chair in place.
 3. Step back in and do the gesture shown at the top of the preview.
@@ -95,7 +95,9 @@ replaced by the captured background, matched to the camera's current exposure.
 
 Press `B` (or click **B background** in the preview) to cycle: **off → blur → each image**
 in `backgrounds/`. The choice is remembered. Drop any `.jpg`, `.png` or `.webp` into
-`backgrounds/` (git ignores its contents); images are scaled to fill the frame. The style
+`backgrounds/` (git ignores its contents); images are scaled to fill the frame. VanishCam cuts you out with MediaPipe's general
+selfie segmenter, keeps only the regions that are actually you (so lamps, door frames or a
+pull-up bar don't show through) and snaps the edge to your hair and face. The style
 sits underneath the effects, so smoke, crows and particles still show, and while you are
 vanished the whole frame shows the chosen background.
 
@@ -117,7 +119,8 @@ at the bottom of the preview are clickable too.
 | --- | --- |
 | `1`–`5` | Switch effect (the captured background is kept) |
 | `V` / `R` | Vanish / reappear manually (not in Goku) |
-| `Space` | Capture a new background |
+| `Space` | Recapture the empty room (step out of frame) |
+| `C` | Next camera (skips the OBS Virtual Camera, VanishCam's own output) |
 | `B` | Background: off → blur → your images |
 | `F` | Fullscreen |
 | `H` | Hide or show the button bar |
@@ -129,7 +132,7 @@ orientation (the preview is mirrored, like a mirror).
 ### Options
 
 ```sh
-./vanishcam --mode goku --camera 0   # skip the launcher
+./vanishcam --mode goku --camera 0   # start with this effect and camera index
 ./vanishcam --goku-delay 1           # Goku hold time in seconds (default 0.3)
 ./vanishcam --background blur        # off, blur, or an image (default: last choice)
 ./vanishcam --no-virtual-camera      # skip the OBS driver
@@ -161,7 +164,7 @@ orientation (the preview is mirrored, like a mirror).
 ./vanishcam --self-test   # checks models, assets and audio without opening a camera
 ```
 
-Layout: `vanish_cam.py` (app, launcher, overlay), `*_effect.py` (effects),
+Layout: `vanish_cam.py` (app, overlay, camera switching), `*_effect.py` (effects),
 `vanish_sound.py`, `mediapipe_log_filter.py` (quiets MediaPipe logs), `backgrounds/`, `models/`,
 `assets/`, `tests/`.
 

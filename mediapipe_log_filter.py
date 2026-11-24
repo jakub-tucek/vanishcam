@@ -1,7 +1,7 @@
-"""Keep MediaPipe's internal ROI notice out of the local app console.
+"""Keep MediaPipe's info logs and internal ROI notice out of the app console.
 
 The HandLandmarker task does not expose its calculator graph, so the app
-cannot connect IMAGE_DIMENSIONS to that graph. Other stderr messages remain
+cannot connect IMAGE_DIMENSIONS to that graph. Warnings and errors remain
 visible, including actual model and camera errors.
 """
 
@@ -18,9 +18,15 @@ _ROI_SOURCE = b"landmark_projection_calculator.cc:"
 _CHILD_MARKER = "VANISH_CAM_FILTERED_CHILD"
 
 
+_INFO_PREFIXES = (b"INFO: ", b"I0000 ")
+_FEEDBACK_NOTICE = b"Feedback manager requires a model with a single signature inference"
+
+
 def forward_stderr(source, destination) -> None:
     for line in source:
         if _ROI_SOURCE in line and _ROI_NOTICE in line:
+            continue
+        if line.startswith(_INFO_PREFIXES) or _FEEDBACK_NOTICE in line:
             continue
         if hasattr(destination, "buffer"):
             destination.buffer.write(line)

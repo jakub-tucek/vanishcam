@@ -1,13 +1,16 @@
 import unittest
+from contextlib import ExitStack
 from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
 import numpy as np
 import mediapipe as mp
 
-from local_app.goku_effect import (
+from goku_effect import (
     GokuGestureGate, GokuPoseRecognizer, GokuTeleport, HOLD_SECONDS, TELEPORT_SECONDS,
     fingers_on_forehead,
 )
+import vanish_cam as app
 
 
 def gesture_hand(index_tip=(130, 55), middle_tip=(139, 55), open_ring=False):
@@ -113,20 +116,27 @@ class GokuTimingTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 GokuGestureGate(hold_seconds=duration)
 
-    def test_one_second_and_release_required_for_reappearance(self):
+    def test_default_hold_is_fast(self):
+        self.assertEqual(HOLD_SECONDS, 0.3)
         gate = GokuGestureGate()
+        for now in (1.0, 1.1, 1.2):
+            self.assertFalse(gate.update(True, now))
+        self.assertTrue(gate.update(True, 1.0 + HOLD_SECONDS))
+
+    def test_one_second_and_release_required_for_reappearance(self):
+        gate = GokuGestureGate(hold_seconds=1.0)
         for index in range(10):
             self.assertFalse(gate.update(True, 10.0 + index * 0.1))
-        self.assertTrue(gate.update(True, 10.0 + HOLD_SECONDS))
+        self.assertTrue(gate.update(True, 11.0))
         self.assertFalse(gate.update(True, 20.0))  # Holding cannot retrigger.
         self.assertFalse(gate.update(False, 20.1))
         self.assertFalse(gate.update(False, 20.5))
         for index in range(10):
             self.assertFalse(gate.update(True, 21.0 + index * 0.1))
-        self.assertTrue(gate.update(True, 21.0 + HOLD_SECONDS))
+        self.assertTrue(gate.update(True, 22.0))
 
     def test_breaking_pose_resets_countdown(self):
-        gate = GokuGestureGate()
+        gate = GokuGestureGate(hold_seconds=1.0)
         gate.update(True, 1.0)
         gate.update(False, 2.0)
         gate.update(False, 2.3)
@@ -135,7 +145,7 @@ class GokuTimingTests(unittest.TestCase):
         self.assertTrue(gate.update(True, 4.0))
 
     def test_single_tracking_miss_does_not_erase_a_real_hold(self):
-        gate = GokuGestureGate()
+        gate = GokuGestureGate(hold_seconds=1.0)
         gate.update(True, 1.0)
         gate.update(True, 1.1)
         gate.update(False, 1.2)
@@ -195,6 +205,39 @@ class TeleportTests(unittest.TestCase):
             effect.render(background, 0.10, False),
             effect.render(background, 0.17, False),
         ))
+
+
+class GokuDelayLoopTests(unittest.TestCase):
+    def test_fractional_choice_controls_both_disappearance_and_reappearance(self):
+        clock=[0.]
+        times=iter((.1,4.1,4.3,4.401,4.8,4.95,5.35,5.5,5.601,6.0))
+        frame=np.full((80,120,3),100,np.uint8)
+        capture=Mock()
+        def read():
+            clock[0]=next(times)
+            return True,frame.copy()
+        capture.read.side_effect=read
+        recognizer=Mock()
+        recognizer.recognize_pose.side_effect=lambda image,ms: clock[0] not in (4.95,5.35)
+        sound=Mock()
+        args=SimpleNamespace(camera=0,width=120,height=80,fps=30,fullscreen=False,
+                             no_mirror=True,gesture_debug=False,goku_delay=.1)
+        with ExitStack() as stack:
+            stack.enter_context(patch('builtins.print'))
+            stack.enter_context(patch.object(app,'download_models'))
+            stack.enter_context(patch.object(app,'open_camera',return_value=capture))
+            stack.enter_context(patch.object(app,'create_tasks',return_value=(Mock(),recognizer)))
+            stack.enter_context(patch.object(app,'open_virtual_camera',return_value=None))
+            stack.enter_context(patch.object(app,'VanishSound',return_value=sound))
+            stack.enter_context(patch.object(app,'person_mask',return_value=np.ones((80,120),np.float32)))
+            stack.enter_context(patch.object(app.time,'perf_counter',side_effect=lambda:clock[0]))
+            for name in ('namedWindow','resizeWindow','destroyAllWindows','imshow'):
+                stack.enter_context(patch.object(app.cv2,name))
+            stack.enter_context(patch.object(app.cv2,'getWindowProperty',return_value=1))
+            stack.enter_context(patch.object(app.cv2,'waitKey',side_effect=([0]*9+[ord('q')])) )
+            with ExitStack() as resources:
+                self.assertEqual(app.run_camera(args,resources,'goku'),0)
+        self.assertEqual(sound.play.call_count,2)
 
 
 if __name__ == "__main__":

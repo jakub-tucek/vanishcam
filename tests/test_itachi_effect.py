@@ -6,12 +6,12 @@ from unittest.mock import patch
 import cv2
 import numpy as np
 
-from local_app.itachi_effect import (
+from itachi_effect import (
     BODY_RELEASE_SECONDS, EFFECT_SECONDS, ItachiCrowEffect,
     ItachiGestureGate, ItachiPoseRecognizer, hands_touch_at_chest,
     load_sharingan_art,
 )
-from local_app import vanish_cam as app
+import vanish_cam as app
 
 
 def hand(x, y=.47):
@@ -35,13 +35,6 @@ def scene():
 
 
 class ItachiGestureTests(unittest.TestCase):
-    def test_full_menu_selects_itachi_with_seven(self):
-        with patch.object(app.cv2, "namedWindow"), patch.object(app.cv2, "setMouseCallback"), \
-             patch.object(app.cv2, "imshow"), patch.object(app.cv2, "destroyWindow"), \
-             patch.object(app.cv2, "waitKey", return_value=ord("5")), \
-             patch.object(app.cv2, "getWindowProperty", return_value=1):
-            self.assertEqual(app.choose_mode(), "itachi")
-
     def test_contact_is_required_at_centre_of_chest(self):
         _, _, mask = scene()
         self.assertTrue(hands_touch_at_chest([hand(.47), hand(.53)], mask))

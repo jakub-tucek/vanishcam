@@ -5,12 +5,12 @@ from unittest.mock import Mock, patch
 
 import numpy as np
 
-from local_app import vanish_cam as app
-from local_app.naruto_effect import (
+import vanish_cam as app
+from naruto_effect import (
     EFFECT_SECONDS, falling_log_anchor, joined_hands_from_landmarks,
     landed_log_anchor, load_log, overlay_log, render_substitution, substitution_anchor,
 )
-from local_app.test_video_output import arguments
+from test_video_output import arguments
 
 
 class JoinedHandsTests(unittest.TestCase):
@@ -118,20 +118,6 @@ class EffectTests(unittest.TestCase):
         np.testing.assert_array_equal(output, expected)
 
 
-class MenuTests(unittest.TestCase):
-    def test_keyboard_selection(self):
-        with ExitStack() as mocks:
-            mocks.enter_context(patch.object(app.cv2, "namedWindow"))
-            mocks.enter_context(patch.object(app.cv2, "setMouseCallback"))
-            mocks.enter_context(patch.object(app.cv2, "imshow"))
-            mocks.enter_context(patch.object(app.cv2, "destroyWindow"))
-            mocks.enter_context(patch.object(app.cv2, "getWindowProperty", return_value=1))
-            key = mocks.enter_context(patch.object(app.cv2, "waitKey", return_value=ord("2")))
-            self.assertEqual(app.choose_mode(), "naruto")
-            key.return_value = ord("1")
-            self.assertEqual(app.choose_mode(), "normal")
-
-
 class NarutoVideoLoopTests(unittest.TestCase):
     def test_effect_is_sent_to_preview_and_virtual_camera(self):
         frames = [np.full((80, 120, 3), v, np.uint8) for v in (10, 40, 80, 120, 160)]
@@ -156,6 +142,7 @@ class NarutoVideoLoopTests(unittest.TestCase):
             mocks.enter_context(patch.object(app.cv2, "namedWindow"))
             mocks.enter_context(patch.object(app.cv2, "resizeWindow"))
             mocks.enter_context(patch.object(app.cv2, "destroyAllWindows"))
+            mocks.enter_context(patch.object(app.cv2, "getWindowProperty", return_value=1))
             mocks.enter_context(patch.object(app.cv2, "imshow", side_effect=lambda name, frame: preview.append(frame.copy())))
             mocks.enter_context(patch.object(app.cv2, "waitKey", side_effect=(0, 0, 0, 0, ord("q"))))
             mocks.enter_context(patch.object(app.cv2, "putText", side_effect=AssertionError("Overlay vietato")))

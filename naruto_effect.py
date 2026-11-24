@@ -17,6 +17,10 @@ def joined_hands_from_landmarks(hands, width: int, height: int) -> bool:
     """Recognize two nearby, similarly oriented open hands in image space."""
     if len(hands) < 2:
         return False
+    # Hands cut off by the frame edge (e.g. resting on a knee below the camera) are guesses
+    # by the landmarker, not a deliberate palms-together pose.
+    if any(not (0.0 <= p.x <= 1.0 and 0.0 <= p.y <= 1.0) for hand in hands[:2] for p in hand):
+        return False
     points = [np.array([(p.x * width, p.y * height) for p in hand])
               for hand in hands[:2] if len(hand) == 21]
     if len(points) != 2 or not all(np.isfinite(hand).all() for hand in points):

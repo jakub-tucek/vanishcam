@@ -272,6 +272,26 @@ class LoopControlTests(unittest.TestCase):
         self.assertEqual([c.args[0] for c in tasks.call_args_list], ["normal", "naruto"])
         self.assertIn("[Webcam] Effect: Naruto", messages)
 
+    def test_g_pauses_gesture_recognition_until_pressed_again(self):
+        recognize = Mock(return_value=("Victory", 0.95))
+        times = (0.1, 4.1, 4.3, 4.5, 4.7, 4.9, 5.1)
+        keys = (0, ord("g"), 0, 0, ord("g"), 0, ord("q"))
+        _, messages = self.run_loop("normal", times, keys,
+                                    extra=(patch.object(app, "recognize_gesture", recognize),))
+        self.assertIn("[Webcam] Gestures off: use V and R.", messages)
+        self.assertIn("[Webcam] Gestures on.", messages)
+        # Gestures went off at 4.1 and back on at 4.7: only the 4.9 frame was checked.
+        self.assertEqual(recognize.call_count, 1)
+
+    def test_goku_keys_work_only_while_gestures_are_off(self):
+        recognizer = Mock()
+        recognizer.recognize_pose.return_value = False
+        teleport = patch.object(app, "GokuTeleport")
+        _, messages = self.run_loop(
+            "goku", (0.1, 4.1, 4.3, 4.5, 4.7), (0, ord("v"), ord("g"), ord("v"), ord("q")),
+            recognizer=recognizer, extra=(teleport,))
+        self.assertEqual([m for m in messages if m.startswith("[Goku]")], ["[Goku] Disappearance!"])
+
     def test_never_starts_on_its_own_virtual_camera(self):
         names = patch.object(app, "camera_names", return_value=["OBS Virtual Camera", "MacBook Pro Camera"])
         _, messages = self.run_loop("normal", (0.1, 0.2), (0, ord("q")), extra=(names,))
@@ -472,6 +492,20 @@ class HudTests(unittest.TestCase):
         (left, top, right, bottom), key = targets[2]
         self.assertEqual(app.hud_key_at(targets, (left + right) // 2, (top + bottom) // 2), ord("3"))
         self.assertIsNone(app.hud_key_at(targets, 480, 270))
+
+    def test_buttons_wrap_inside_a_narrow_frame_and_goku_keys_return_when_gestures_are_off(self):
+        frame = np.zeros((360, 640, 3), np.uint8)
+        values = {"b": "meet-ottoman-camp", "c": "MacBook Pro Camera", "g": "off"}
+        _, targets = app.draw_hud(frame, "goku", app.ALL_MODES, "", "", "Preview only",
+                                  app.HUD_IDLE, True, values)
+        for (left, top, right, bottom), _ in targets:
+            self.assertTrue(0 <= left < right <= 640 and 0 <= top < bottom <= 360)
+        self.assertIn(ord("v"), {key for _, key in targets})
+        self.assertGreater(len({box[1] for box, _ in targets}), 2)  # Chips plus 2+ button rows.
+
+    def test_status_when_gestures_are_off(self):
+        self.assertIn("press V", app.hud_status("goku", "ready", None, 0.3, None, gestures=False))
+        self.assertIn("press R", app.hud_status("itachi", "vanished", None, 0.3, None, gestures=False))
 
     def test_status_follows_phase(self):
         self.assertIn("3s", app.hud_status("normal", "calibrating", 3, 1.0, None))

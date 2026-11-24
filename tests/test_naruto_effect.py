@@ -14,13 +14,28 @@ from test_video_output import arguments
 
 
 class JoinedHandsTests(unittest.TestCase):
-    def test_joined_hands_start_effect_immediately(self):
-        state = app.AppState(phase="ready")
-        self.assertFalse(app.start_naruto_on_join(state, False, 1.0))
-        self.assertTrue(app.start_naruto_on_join(state, True, 1.1))
+    @staticmethod
+    def gate():
+        return app.GokuGestureGate(hold_seconds=app.NARUTO_HOLD_SECONDS)
+
+    def test_palms_must_stay_together_before_vanishing(self):
+        state, gate = app.AppState(phase="ready"), self.gate()
+        for now in (1.0, 1.1, 1.2):
+            self.assertFalse(app.start_naruto_on_join(state, gate, True, now))
+        self.assertTrue(app.start_naruto_on_join(state, gate, True, 1.3))
         self.assertEqual(state.phase, "naruto_vanishing")
-        self.assertEqual(state.vanish_started, 1.1)
-        self.assertFalse(app.start_naruto_on_join(state, True, 1.2))
+        self.assertEqual(state.vanish_started, 1.3)
+
+    def test_a_brief_touch_never_triggers(self):
+        state, gate = app.AppState(phase="ready"), self.gate()
+        for now, joined in ((1.0, True), (1.1, False), (1.4, False), (1.5, True), (1.6, True)):
+            self.assertFalse(app.start_naruto_on_join(state, gate, joined, now))
+        self.assertEqual(state.phase, "ready")
+
+    def test_hands_cut_off_by_the_frame_edge_are_ignored(self):
+        lowered = [[SimpleNamespace(x=point.x, y=point.y + 0.4) for point in self.hand(center)]
+                   for center in (0.45, 0.55)]  # Wrists below the bottom edge, as on a knee.
+        self.assertFalse(joined_hands_from_landmarks(lowered, 640, 480))
 
     @staticmethod
     def hand(center_x, upward=True):
@@ -120,9 +135,17 @@ class EffectTests(unittest.TestCase):
 
 class NarutoVideoLoopTests(unittest.TestCase):
     def test_effect_is_sent_to_preview_and_virtual_camera(self):
-        frames = [np.full((80, 120, 3), v, np.uint8) for v in (10, 40, 80, 120, 160)]
+        clock = [0.0]
+        times = iter((0.1, 4.1, 4.2, 4.3, 4.4, 4.5, 4.6, 5.0, 6.2, 6.3))
+        frames = []
+
+        def read():
+            clock[0] = next(times)
+            frames.append(np.full((80, 120, 3), int(clock[0] * 30) % 250, np.uint8))
+            return True, frames[-1]
+
         capture = Mock()
-        capture.read.side_effect = [(True, frame) for frame in frames]
+        capture.read.side_effect = read
         segmenter, recognizer = Mock(), Mock()
         recognizer.recognize_joined_hands.return_value = True
         sound = Mock()
@@ -136,28 +159,24 @@ class NarutoVideoLoopTests(unittest.TestCase):
             mocks.enter_context(patch.object(app, "VanishSound", return_value=sound))
             mocks.enter_context(patch.object(app, "open_virtual_camera", return_value=virtual))
             mocks.enter_context(patch.object(app, "person_mask", return_value=np.ones((80, 120), np.float32)))
-            mocks.enter_context(patch.object(app.time, "perf_counter", side_effect=(
-                0, 0, 0.1, 4.1, 4.3, 4.35, 4.40, 4.42, 5.05, 5.1, 5.9,
-            )))
+            mocks.enter_context(patch.object(app.time, "perf_counter", side_effect=lambda: clock[0]))
             mocks.enter_context(patch.object(app.cv2, "namedWindow"))
             mocks.enter_context(patch.object(app.cv2, "resizeWindow"))
             mocks.enter_context(patch.object(app.cv2, "destroyAllWindows"))
             mocks.enter_context(patch.object(app.cv2, "getWindowProperty", return_value=1))
             mocks.enter_context(patch.object(app.cv2, "imshow", side_effect=lambda name, frame: preview.append(frame.copy())))
-            mocks.enter_context(patch.object(app.cv2, "waitKey", side_effect=(0, 0, 0, 0, ord("q"))))
+            mocks.enter_context(patch.object(app.cv2, "waitKey", side_effect=[0] * 9 + [ord("q")]))
             mocks.enter_context(patch.object(app.cv2, "putText", side_effect=AssertionError("Overlay vietato")))
             mocks.enter_context(patch("builtins.print"))
             self.assertEqual(app.run(), 0)
-        self.assertEqual(len(preview), 5)
         for sent, shown in zip(virtual.send.call_args_list, preview):
             np.testing.assert_array_equal(sent.args[0], shown)
-        self.assertTrue(np.any(preview[2] != frames[2]))
-        self.assertTrue(np.any(preview[3] != frames[3]))
-        self.assertTrue(np.any(preview[4] != frames[1]))  # Tronco persistente.
-        recognizer.recognize_joined_hands.assert_called_once()
+        # Palms held from 4.2: still live at 4.4, the smoke starts once 0.3 s have passed.
+        np.testing.assert_array_equal(preview[4], frames[4])
+        self.assertTrue(np.any(preview[6] != frames[6]))
+        self.assertTrue(np.any(preview[9] != frames[9]))  # The log stays after the smoke.
         sound.play.assert_called_once()
         sound.close.assert_called_once()
-
 
 if __name__ == "__main__":
     unittest.main()

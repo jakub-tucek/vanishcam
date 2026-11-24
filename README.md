@@ -83,7 +83,7 @@ installed it disappears.
 | Key | Effect | Gesture |
 | --- | --- | --- |
 | `1` | Normal | V sign (index and middle finger): dissolve |
-| `2` | Naruto | Palms pressed together: smoke and a falling log |
+| `2` | Naruto | Palms pressed together, both hands fully in view, for 0.3 s: smoke and a falling log |
 | `3` | Particles | V sign: you break into drifting particles |
 | `4` | Goku | Two joined fingers on the forehead for 0.3 s: teleport; repeat to return |
 | `5` | Itachi | Both hands touching at the chest: flock of crows; repeat to return |
@@ -118,7 +118,8 @@ at the bottom of the preview are clickable too.
 | Key | Action |
 | --- | --- |
 | `1`–`5` | Switch effect (the captured background is kept) |
-| `V` / `R` | Vanish / reappear manually (not in Goku) |
+| `G` | Gestures on/off: when off nothing triggers by itself; use `V` / `R` (Goku too) |
+| `V` / `R` | Vanish / reappear manually (in Goku only while gestures are off) |
 | `Space` | Recapture the empty room (step out of frame) |
 | `C` | Next camera (skips the OBS Virtual Camera, VanishCam's own output) |
 | `B` | Background: off → blur → your images |
@@ -135,6 +136,7 @@ orientation (the preview is mirrored, like a mirror).
 ./vanishcam --mode goku --camera 0   # start with this effect and camera index
 ./vanishcam --goku-delay 1           # Goku hold time in seconds (default 0.3)
 ./vanishcam --background blur        # off, blur, or an image (default: last choice)
+./vanishcam --no-gestures            # start with gestures off (G turns them on)
 ./vanishcam --no-virtual-camera      # skip the OBS driver
 ./vanishcam --virtual-camera         # exit if the virtual camera is unavailable
 ./vanishcam --no-hud                 # plain preview

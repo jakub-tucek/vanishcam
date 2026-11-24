@@ -28,7 +28,7 @@ from mediapipe.tasks.python import vision
 
 from itachi_effect import (
     CROW_SHEET_PATH, SHARINGAN_PATH, EFFECT_SECONDS as ITACHI_SECONDS, ItachiCrowEffect,
-    ItachiGestureGate, ItachiPoseRecognizer, load_crow_sprites, load_sharingan_art,
+    ItachiPoseRecognizer, load_crow_sprites, load_sharingan_art,
 )
 from goku_effect import (
     GokuGestureGate, GokuPoseRecognizer, GokuTeleport, HOLD_SECONDS,
@@ -51,6 +51,7 @@ SEGMENTER_MODEL = MODEL_DIR / "selfie_segmenter.tflite"
 GESTURE_MODEL = MODEL_DIR / "gesture_recognizer.task"
 HAND_MODEL = MODEL_DIR / "hand_landmarker.task"
 FACE_MODEL = MODEL_DIR / "blaze_face_short_range.tflite"
+POSE_MODEL = MODEL_DIR / "pose_landmarker_lite.task"
 ALL_MODES = ("normal", "naruto", "particles", "goku", "itachi")
 
 MODEL_URLS = {
@@ -66,6 +67,10 @@ MODEL_URLS = {
         "https://storage.googleapis.com/mediapipe-models/face_detector/"
         "blaze_face_short_range/float16/1/blaze_face_short_range.tflite"
     ),
+    POSE_MODEL: (
+        "https://storage.googleapis.com/mediapipe-models/pose_landmarker/"
+        "pose_landmarker_lite/float16/latest/pose_landmarker_lite.task"
+    ),
 }
 
 MODE_LABELS = {
@@ -73,14 +78,14 @@ MODE_LABELS = {
     "naruto": ("Naruto", "Palms together  /  log and smoke"),
     "particles": ("Particles", "V sign  /  particles in the wind"),
     "goku": ("Goku", "Two fingers on forehead  /  teleport"),
-    "itachi": ("Itachi", "Hands at chest  /  flock of crows"),
+    "itachi": ("Itachi", "Arms crossed  /  flock of crows"),
 }
 GESTURE_HINTS = {
     "normal": "Show a V sign to vanish",
     "particles": "Show a V sign to vanish",
     "naruto": "Press your palms together to vanish",
     "goku": "Hold two fingers on your forehead",
-    "itachi": "Touch your hands at your chest",
+    "itachi": "Cross your arms over your chest",
 }
 SETTINGS_PATH = (Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config")
                  / "vanishcam" / "settings.json")
@@ -420,6 +425,8 @@ def download_models(mode: str = "normal") -> None:
             continue
         if mode != "goku" and destination == FACE_MODEL:
             continue
+        if mode != "itachi" and destination == POSE_MODEL:
+            continue
         if destination.exists() and destination.stat().st_size > 100_000:
             continue
 
@@ -507,7 +514,17 @@ def create_tasks(mode: str = "normal") -> tuple[
             segmenter.close()
             raise
         return segmenter, GokuPoseRecognizer(hands, face, fallback_hands)
-    if mode in ("naruto", "itachi"):
+    if mode == "itachi":
+        segmenter = vision.ImageSegmenter.create_from_options(segmenter_options)
+        try:
+            pose = vision.PoseLandmarker.create_from_options(vision.PoseLandmarkerOptions(
+                base_options=python.BaseOptions(model_asset_path=str(POSE_MODEL)),
+                running_mode=vision.RunningMode.VIDEO, num_poses=1))
+        except Exception:
+            segmenter.close()
+            raise
+        return segmenter, ItachiPoseRecognizer(pose)
+    if mode == "naruto":
         if not HAND_MODEL.is_file():
             raise RuntimeError(f"Hand model not found: {HAND_MODEL}")
         options = vision.HandLandmarkerOptions(
@@ -550,8 +567,6 @@ def create_tasks(mode: str = "normal") -> tuple[
     except Exception:
         segmenter.close()
         raise
-    if mode == "itachi":
-        return segmenter, ItachiPoseRecognizer(primary, alternate)
     return segmenter, wrapper_class(primary, alternate)
 
 
@@ -1043,6 +1058,7 @@ def start_vanish_on_gesture(state: AppState, name: str, score: float, now: float
 
 
 NARUTO_HOLD_SECONDS = 0.3
+ITACHI_HOLD_SECONDS = 0.3
 
 
 def start_naruto_on_join(state: AppState, gate: GokuGestureGate, joined: bool, now: float) -> bool:
@@ -1190,7 +1206,7 @@ def hud_status(mode: str, phase: str, calibration_remaining: int | None,
                 return f"Reappearing in {goku_countdown:g}s"
             return "Vanished: repeat the gesture to reappear"
         if mode == "itachi":
-            return "Vanished: touch your hands at your chest to reappear"
+            return "Vanished: cross your arms again to reappear"
         return "Vanished: press R to reappear"
     if phase in ("goku_appearing", "itachi_appearing"):
         return "Reappearing..."
@@ -1201,7 +1217,7 @@ def self_test() -> int:
     """Check bundled resources and model initialization without opening a webcam."""
     for mode in ALL_MODES:
         download_models(mode)
-    required = [SEGMENTER_MODEL, GESTURE_MODEL, HAND_MODEL, FACE_MODEL, TELEPORT_SOUND_PATH,
+    required = [SEGMENTER_MODEL, GESTURE_MODEL, HAND_MODEL, FACE_MODEL, POSE_MODEL, TELEPORT_SOUND_PATH,
                 CROW_SHEET_PATH, SHARINGAN_PATH, LOG_PATH, SOUND_PATH]
     missing = [path.name for path in required if not path.is_file()]
     if missing:
@@ -1305,7 +1321,7 @@ def run_camera(args: argparse.Namespace, resources: ExitStack, mode: str) -> int
     exposure_gain: np.ndarray | None = None
     particle_effect: ParticleEffect | None = None
     itachi_effect: ItachiCrowEffect | None = None
-    itachi_gate = ItachiGestureGate() if mode == "itachi" else None
+    itachi_gate = GokuGestureGate(hold_seconds=ITACHI_HOLD_SECONDS) if mode == "itachi" else None
     goku_effect: GokuTeleport | None = None
     goku_delay = getattr(args, "goku_delay", None) or HOLD_SECONDS
     goku_gate = GokuGestureGate(hold_seconds=goku_delay) if mode == "goku" else None
@@ -1424,14 +1440,16 @@ def run_camera(args: argparse.Namespace, resources: ExitStack, mode: str) -> int
                     and now - state.last_gesture_check >= 0.09):
                 state.last_gesture_check = now
                 mp_image = to_mp_image(camera_frame)
-                mask = person_mask(segmenter, mp_image, stamp(), width, height)
-                last_mask, last_mask_at = mask, now
-                touching = recognizer.recognize_pose(mp_image, stamp(), mask)
-                hud_detail = f"Hands seen: {recognizer.last_hand_count}   at chest: {'yes' if touching else 'no'}"
+                crossed = recognizer.recognize_pose(mp_image, stamp())
+                hud_detail = recognizer.last_cross.describe()
                 if args.gesture_debug and now - last_gesture_report >= 1.0:
-                    print(f"[Itachi] hands={recognizer.last_hand_count}, chest={touching}")
+                    measures = " ".join(f"{name}={value:.2f}" for name, value
+                                        in recognizer.last_cross.measures.items())
+                    print(f"[Itachi] crossed={crossed} {measures}")
                     last_gesture_report = now
-                if itachi_gate.update(touching, now):
+                if itachi_gate.update(crossed, now):
+                    mask = person_mask(segmenter, mp_image, stamp(), width, height)
+                    last_mask, last_mask_at = mask, now
                     try:
                         itachi_effect = ItachiCrowEffect(scene_frame, mask)
                     except ValueError:
@@ -1655,7 +1673,8 @@ def run_camera(args: argparse.Namespace, resources: ExitStack, mode: str) -> int
                 print(f"[Webcam] Effect: {MODE_LABELS[mode][0]}")
                 download_models(mode)
                 segmenter, recognizer, log_sprite, vanish_sound = load_kit(mode)
-                itachi_gate = ItachiGestureGate() if mode == "itachi" else None
+                itachi_gate = (GokuGestureGate(hold_seconds=ITACHI_HOLD_SECONDS)
+                               if mode == "itachi" else None)
                 goku_gate = GokuGestureGate(hold_seconds=goku_delay) if mode == "goku" else None
                 naruto_gate = (GokuGestureGate(hold_seconds=NARUTO_HOLD_SECONDS)
                                if mode == "naruto" else None)

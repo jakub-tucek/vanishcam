@@ -86,7 +86,7 @@ installed it disappears.
 | `2` | Naruto | Hand seal for 0.3 s: palms pressed together, pointing up, fully in view (chest or face height). The preview says which part is missing |
 | `3` | Particles | V sign: you break into drifting particles |
 | `4` | Goku | Two joined fingers on the forehead for 0.3 s: teleport; repeat to return |
-| `5` | Itachi | Both hands touching at the chest: flock of crows; repeat to return |
+| `5` | Itachi | Arms crossed over your chest for 0.3 s: flock of crows; cross again to return |
 
 While vanished (Normal, Particles, Goku) the room stays live and only your silhouette is
 replaced by the captured background, matched to the camera's current exposure.

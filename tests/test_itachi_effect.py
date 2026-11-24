@@ -7,21 +7,20 @@ import cv2
 import numpy as np
 
 from itachi_effect import (
-    BODY_RELEASE_SECONDS, EFFECT_SECONDS, ItachiCrowEffect,
-    ItachiGestureGate, ItachiPoseRecognizer, hands_touch_at_chest,
-    load_sharingan_art,
+    BODY_RELEASE_SECONDS, EFFECT_SECONDS, ItachiCrowEffect, ItachiPoseRecognizer,
+    analyze_arm_cross, load_sharingan_art,
 )
 import vanish_cam as app
 
 
-def hand(x, y=.47):
-    points = [SimpleNamespace(x=x, y=y) for _ in range(21)]
-    points[0] = SimpleNamespace(x=x, y=y + .09)
-    for index, offset in ((5, -.025), (9, -.008), (13, .008), (17, .025)):
-        points[index] = SimpleNamespace(x=x + offset, y=y)
-    for index, offset in ((4, -.025), (8, -.025), (12, -.008),
-                          (16, .008), (20, .025)):
-        points[index] = SimpleNamespace(x=x + offset, y=y - .07)
+def pose(left_wrist_x, right_wrist_x, wrist_y=0.70, visibility=0.8,
+         left_shoulder_x=0.62, right_shoulder_x=0.38):
+    """33 pose landmarks; unmirrored camera, so the person's left shoulder is on the right."""
+    points = [SimpleNamespace(x=0.5, y=0.5, visibility=0.9) for _ in range(33)]
+    points[11] = SimpleNamespace(x=left_shoulder_x, y=0.55, visibility=0.95)
+    points[12] = SimpleNamespace(x=right_shoulder_x, y=0.55, visibility=0.95)
+    points[15] = SimpleNamespace(x=left_wrist_x, y=wrist_y, visibility=visibility)
+    points[16] = SimpleNamespace(x=right_wrist_x, y=wrist_y, visibility=visibility)
     return points
 
 
@@ -35,32 +34,43 @@ def scene():
 
 
 class ItachiGestureTests(unittest.TestCase):
-    def test_contact_is_required_at_centre_of_chest(self):
-        _, _, mask = scene()
-        self.assertTrue(hands_touch_at_chest([hand(.47), hand(.53)], mask))
-        self.assertFalse(hands_touch_at_chest([hand(.47)], mask))
-        self.assertFalse(hands_touch_at_chest([hand(.25), hand(.75)], mask))
-        self.assertFalse(hands_touch_at_chest([hand(.47, .09), hand(.53, .09)], mask))
-        self.assertFalse(hands_touch_at_chest([hand(.76), hand(.82)], mask))
+    def test_crossed_arms_at_chest_trigger(self):
+        cross = analyze_arm_cross(pose(0.45, 0.55))
+        self.assertTrue(cross.ok, cross)
+        self.assertLess(cross.measures["separation"], 0)
 
-    def test_gate_triggers_immediately_and_requires_release(self):
-        gate = ItachiGestureGate()
-        self.assertTrue(gate.update(True, 1.0))
-        self.assertFalse(gate.update(True, 1.1))
-        self.assertFalse(gate.update(False, 2.0))
-        self.assertFalse(gate.update(False, 2.26))
-        self.assertTrue(gate.update(True, 2.35))
+    def test_hands_meeting_without_crossing_still_count_as_crossed_wrists(self):
+        self.assertTrue(analyze_arm_cross(pose(0.52, 0.48)).crossed)
 
-    def test_hand_recognizer_uses_video_frame(self):
-        frame, _, mask = scene()
-        primary, fallback = Mock(), Mock()
-        primary.detect_for_video.return_value = SimpleNamespace(
-            hand_landmarks=[hand(.47), hand(.53)])
+    def test_poses_that_must_not_trigger(self):
+        cases = {
+            "own side": (pose(0.62, 0.38), "crossed"),
+            "resting low": (pose(0.45, 0.55, wrist_y=0.95), "at_chest"),
+            "wrists out of view": (pose(0.45, 0.55, visibility=0.2), "visible"),
+        }
+        for name, (landmarks, failing) in cases.items():
+            with self.subTest(name):
+                cross = analyze_arm_cross(landmarks)
+                self.assertFalse(cross.ok)
+                self.assertFalse(getattr(cross, failing))
+        self.assertFalse(analyze_arm_cross(pose(0.45, 0.55, left_shoulder_x=0.51,
+                                                right_shoulder_x=0.49)).ok)  # Side-on.
+        self.assertFalse(analyze_arm_cross(None).body)
+
+    def test_feedback_names_what_is_missing(self):
+        self.assertIn("Arms crossed: no", analyze_arm_cross(pose(0.62, 0.38)).describe())
+        self.assertEqual(analyze_arm_cross(None).describe(), "No body in view")
+
+    def test_recognizer_reads_the_pose_landmarker(self):
+        landmarker = Mock()
+        landmarker.detect_for_video.return_value = SimpleNamespace(pose_landmarks=[pose(0.45, 0.55)])
+        recognizer = ItachiPoseRecognizer(landmarker)
         image = app.mp.Image(image_format=app.mp.ImageFormat.SRGB,
-                             data=cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
-        recognizer = ItachiPoseRecognizer(primary, fallback)
-        self.assertTrue(recognizer.recognize_pose(image, 100, mask))
-        fallback.detect.assert_not_called()
+                             data=np.zeros((240, 320, 3), np.uint8))
+        self.assertTrue(recognizer.recognize_pose(image, 100))
+        self.assertTrue(recognizer.last_cross.ok)
+        landmarker.detect_for_video.return_value = SimpleNamespace(pose_landmarks=[])
+        self.assertFalse(recognizer.recognize_pose(image, 200))
 
 
 class ItachiAnimationTests(unittest.TestCase):

@@ -2,11 +2,10 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import lru_cache
 import math
 from pathlib import Path
-from types import SimpleNamespace
 
 import cv2
 import mediapipe as mp
@@ -39,95 +38,80 @@ def _largest_person(mask: np.ndarray) -> tuple[np.ndarray, tuple[int, int, int, 
     return (labels == component).astype(np.uint8), (x, y, width, height)
 
 
-def hands_touch_at_chest(hands, mask: np.ndarray) -> bool:
-    """Require two touching hands over the middle third of the visible torso."""
-    if len(hands) != 2 or any(len(hand) != 21 for hand in hands):
-        return False
-    person = _largest_person(mask)
-    if person is None:
-        return False
-    _, (x, y, width, height) = person
-    frame_height, frame_width = mask.shape
-    points = [np.asarray([(p.x * frame_width, p.y * frame_height) for p in hand], np.float32)
-              for hand in hands]
-    if not all(np.isfinite(p).all() for p in points):
-        return False
-    sizes = [max(float(np.linalg.norm(p[9] - p[0])),
-                 float(np.linalg.norm(p[5] - p[17]))) for p in points]
-    if min(sizes) < 10 or max(sizes) > min(sizes) * 2.5:
-        return False
-    size = sum(sizes) * 0.5
-    palms = [p[[0, 5, 9, 13, 17]].mean(axis=0) for p in points]
-    center = (palms[0] + palms[1]) * 0.5
-    torso_center = x + width * 0.5
-    if (abs(center[0] - torso_center) > max(width * 0.23, height * 0.17)
-            or not y + height * 0.19 <= center[1] <= y + height * 0.79):
-        return False
-    if np.linalg.norm(palms[0] - palms[1]) > size * 1.45:
-        return False
-    # Fingertips or palm edges must meet. Wrist proximity alone is insufficient.
-    contact = [4, 5, 8, 9, 12, 13, 16, 17, 20]
-    distances = np.linalg.norm(points[0][contact, None] - points[1][None, contact], axis=2)
-    return float(np.min(distances)) <= size * 0.48
+# Pose landmark indices (MediaPipe Pose). "Left" and "right" are the person's own sides.
+LEFT_SHOULDER, RIGHT_SHOULDER, LEFT_WRIST, RIGHT_WRIST = 11, 12, 15, 16
+
+# Calibrated on labelled recordings (arms crossed on the chest or shoulders vs hands on their
+# own side, hands meeting in the middle, one hand, resting). Distances are in shoulder widths.
+# Uncrossed arms keep the wrists about one shoulder width apart; crossing brings them
+# together or past each other, so the signed wrist separation tells them apart.
+CROSS_SEPARATION_MAX = 0.3
+CROSS_DEPTH = (0.2, 0.75)       # Wrists on the chest: clearly below the shoulders, above the belly.
+CROSS_VISIBILITY_MIN = 0.5      # Below this the pose model is guessing (arms out of frame).
+
+
+@dataclass(frozen=True)
+class ArmCross:
+    """Result of the Itachi trigger check: arms crossed over the chest."""
+
+    body: bool
+    visible: bool = False
+    crossed: bool = False
+    at_chest: bool = False
+    measures: dict[str, float] = field(default_factory=dict, compare=False)
+
+    @property
+    def ok(self) -> bool:
+        return self.body and self.visible and self.crossed and self.at_chest
+
+    def describe(self) -> str:
+        if not self.body:
+            return "No body in view"
+        if not self.visible:
+            return "Wrists not visible: bring your arms into view"
+        mark = {True: "yes", False: "no"}
+        return f"Arms crossed: {mark[self.crossed]}   at chest height: {mark[self.at_chest]}"
+
+
+def analyze_arm_cross(pose) -> ArmCross:
+    """Check for arms crossed over the chest from one person's pose landmarks."""
+    if not pose or len(pose) <= RIGHT_WRIST:
+        return ArmCross(body=False)
+    left_shoulder, right_shoulder = pose[LEFT_SHOULDER], pose[RIGHT_SHOULDER]
+    left_wrist, right_wrist = pose[LEFT_WRIST], pose[RIGHT_WRIST]
+    shoulder_width = abs(left_shoulder.x - right_shoulder.x)
+    if shoulder_width < 0.05:
+        return ArmCross(body=True)  # Turned side-on: crossing cannot be judged.
+    visibility = min(getattr(left_wrist, "visibility", 1.0) or 0.0,
+                     getattr(right_wrist, "visibility", 1.0) or 0.0)
+    # Unmirrored camera image: the person's left shoulder is on the right, so uncrossed
+    # arms give a positive separation and crossed arms a small or negative one.
+    separation = (left_wrist.x - right_wrist.x) / shoulder_width
+    depth = (((left_wrist.y + right_wrist.y) - (left_shoulder.y + right_shoulder.y)) / 2
+             / shoulder_width)
+    return ArmCross(
+        body=True,
+        visible=visibility > CROSS_VISIBILITY_MIN,
+        crossed=separation < CROSS_SEPARATION_MAX,
+        at_chest=CROSS_DEPTH[0] < depth < CROSS_DEPTH[1],
+        measures={"separation": separation, "depth": depth, "visibility": visibility},
+    )
 
 
 class ItachiPoseRecognizer:
-    """VIDEO hand tracking with a centered IMAGE retry for overlapping hands."""
+    """Detect crossed arms with the MediaPipe pose landmarker."""
 
-    def __init__(self, detector, fallback):
-        self.detector = detector
-        self.fallback = fallback
-        self.last_hand_count = 0
-        self.next_retry_ms = 0
+    def __init__(self, landmarker):
+        self.landmarker = landmarker
+        self.last_cross = ArmCross(body=False)
 
-    def recognize_pose(self, image: mp.Image, timestamp_ms: int, mask: np.ndarray) -> bool:
-        hands = self.detector.detect_for_video(image, timestamp_ms).hand_landmarks
-        self.last_hand_count = len(hands)
-        if hands_touch_at_chest(hands, mask):
-            return True
-        if timestamp_ms < self.next_retry_ms:
-            return False
-        self.next_retry_ms = timestamp_ms + 170
-        rgb = image.numpy_view()
-        x1, x2 = round(image.width * 0.18), round(image.width * 0.82)
-        y1, y2 = round(image.height * 0.16), round(image.height * 0.92)
-        crop = mp.Image(image_format=mp.ImageFormat.SRGB,
-                        data=np.ascontiguousarray(rgb[y1:y2, x1:x2]))
-        recovered = self.fallback.detect(crop).hand_landmarks
-        self.last_hand_count = max(self.last_hand_count, len(recovered))
-        mapped = [[SimpleNamespace(x=(x1 + p.x * crop.width) / image.width,
-                                   y=(y1 + p.y * crop.height) / image.height)
-                   for p in hand] for hand in recovered]
-        return hands_touch_at_chest(mapped, mask)
+    def recognize_pose(self, image: mp.Image, timestamp_ms: int, mask: np.ndarray | None = None) -> bool:
+        poses = self.landmarker.detect_for_video(image, timestamp_ms).pose_landmarks
+        self.last_cross = analyze_arm_cross(poses[0] if poses else None)
+        return self.last_cross.ok
 
     def close(self) -> None:
-        try:
-            self.detector.close()
-        finally:
-            self.fallback.close()
-
-
-@dataclass
-class ItachiGestureGate:
-    armed: bool = True
-    release_started: float | None = None
-
-    def update(self, pose: bool, now: float) -> bool:
-        if not pose:
-            if self.release_started is None:
-                self.release_started = now
-            if now - self.release_started >= 0.25:
-                self.armed = True
-            return False
-        self.release_started = None
-        if self.armed:
-            self.armed = False
-            return True
-        return False
-
-    def reset(self) -> None:
-        self.armed = True
-        self.release_started = None
+        self.landmarker.close()
 
 
 @lru_cache(maxsize=1)

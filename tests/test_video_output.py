@@ -214,7 +214,7 @@ class VideoOutputsTests(unittest.TestCase):
 class LoopControlTests(unittest.TestCase):
     """Drive run_camera frame by frame: each frame read advances the fake clock."""
 
-    def run_loop(self, mode, times, keys, recognizer=None, person_mask=None, extra=()):
+    def run_loop(self, mode, times, keys, recognizer=None, person_mask=None, extra=(), **options):
         clock = [0.0]
         frames = iter(times)
 
@@ -245,23 +245,24 @@ class LoopControlTests(unittest.TestCase):
                 mocks.enter_context(target)
             printed = mocks.enter_context(patch("builtins.print"))
             with ExitStack() as resources:
-                self.assertEqual(app.run_camera(arguments(mode=mode), resources, mode), 0)
+                self.assertEqual(app.run_camera(arguments(mode=mode, **options), resources, mode), 0)
         messages = [c.args[0] for c in printed.call_args_list if c.args]
         return tasks, messages
 
     def test_timestamps_stay_strictly_increasing_within_one_frame(self):
         stamps = []
         recognizer = Mock()
-        recognizer.recognize_pose.side_effect = lambda image, ts, mask: stamps.append(ts) or False
+        recognizer.recognize_pose.return_value = False
         mask = np.ones((80, 120), np.float32)
-        # Frame 3 runs the Itachi gesture check and handles V, both on the segmenter.
+        # With blur on, the segmenter runs for the background every frame; V in Itachi
+        # runs it again in the same frame. MediaPipe rejects a repeated timestamp.
         self.run_loop(
             "itachi", (0.1, 4.1, 4.3, 4.5, 4.7), (0, 0, ord("v"), 0, ord("q")),
             recognizer=recognizer,
             person_mask=lambda segmenter, image, ts, w, h: stamps.append(ts) or mask,
-            extra=(patch.object(app, "ItachiCrowEffect"),),
+            extra=(patch.object(app, "ItachiCrowEffect"),), background="blur",
         )
-        self.assertGreaterEqual(len(stamps), 3)
+        self.assertGreaterEqual(len(stamps), 5)
         self.assertEqual(stamps, sorted(set(stamps)))
 
     def test_number_keys_switch_effect_and_load_its_models(self):

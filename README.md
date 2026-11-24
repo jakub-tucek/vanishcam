@@ -87,8 +87,9 @@ installed it disappears.
 | `3` | Particles | V sign: you break into drifting particles |
 | `4` | Goku | Two joined fingers on the forehead for 0.3 s: teleport; repeat to return |
 | `5` | Itachi | Arms crossed over your chest for 0.3 s: flock of crows; cross again to return |
+| `6` | Snap | Snap your fingers: puff of smoke; snap again to return in another puff |
 
-While vanished (Normal, Particles, Goku) the room stays live and only your silhouette is
+While vanished (Normal, Particles, Goku, Snap) the room stays live and only your silhouette is
 replaced by the captured background, matched to the camera's current exposure.
 
 ### Background blur and custom images

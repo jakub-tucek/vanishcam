@@ -198,8 +198,9 @@ def falling_log_anchor(anchor: tuple[int, int, int], frame_height: int,
     return cx, floor_y - round(bounce), size
 
 
-def _smoke_layer(frame: np.ndarray, anchor: tuple[int, int, int],
-                 age: float, foreground: bool) -> None:
+def draw_smoke(frame: np.ndarray, anchor: tuple[int, int, int], age: float,
+               foreground: bool, burst: float = 0.27, growth: float = 0.54) -> None:
+    """Expanding smoke puffs around anchor; burst is the starting radius (share of size)."""
     if age >= EFFECT_SECONDS:
         return
     cx, cy, size = anchor
@@ -217,7 +218,7 @@ def _smoke_layer(frame: np.ndarray, anchor: tuple[int, int, int],
     if left >= right or top >= bottom:
         return
     layer = np.zeros((bottom - top, right - left, 4), dtype=np.uint8)
-    radius = size * (0.27 + 0.54 * min(age, 1.0))
+    radius = size * (burst + growth * min(age, 1.0))
     for _ in range(22 if foreground else 18):
         angle = rng.uniform(0, 2 * math.pi)
         distance = radius * rng.uniform(0.25, 1.0)
@@ -265,10 +266,10 @@ def render_substitution(frame: np.ndarray, background: np.ndarray, mask: np.ndar
             frame.astype(np.float32) * person_alpha[:, :, None]
             + background.astype(np.float32) * (1.0 - person_alpha[:, :, None])
         ).astype(np.uint8)
-    _smoke_layer(output, anchor, age, foreground=False)
+    draw_smoke(output, anchor, age, foreground=False)
     log_opacity = min(1.0, max(0.0, (age - 0.05) / 0.15))
     moving_anchor = falling_log_anchor(anchor, output.shape[0], age)
     overlay_log(output, sprite, moving_anchor, log_opacity,
                 scale=1.15 - min(age, 0.25) * 0.6, cache=log_cache)
-    _smoke_layer(output, anchor, age, foreground=True)
+    draw_smoke(output, anchor, age, foreground=True)
     return output

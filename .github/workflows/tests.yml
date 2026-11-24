@@ -1,0 +1,43 @@
+name: tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    env:
+      SDL_AUDIODRIVER: dummy
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: OpenCV system libraries
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libgl1 libegl1 libglib2.0-0
+      - name: Launcher creates the venv and installs dependencies
+        if: runner.os != 'Windows'
+        run: ./vanishcam --help
+      - name: Launcher creates the venv and installs dependencies
+        if: runner.os == 'Windows'
+        shell: cmd
+        run: vanishcam.cmd --help
+      - name: Tests
+        shell: bash
+        run: |
+          python=.venv/bin/python
+          [ -x "$python" ] || python=.venv/Scripts/python.exe
+          "$python" -m pip install --quiet -r requirements-dev.txt
+          "$python" -m pytest -q
+      - name: Self-test (downloads models, builds every effect's MediaPipe tasks)
+        shell: bash
+        run: |
+          python=.venv/bin/python
+          [ -x "$python" ] || python=.venv/Scripts/python.exe
+          "$python" vanish_cam.py --self-test

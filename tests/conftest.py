@@ -11,5 +11,5 @@ def isolated_settings(tmp_path, monkeypatch):
 
 @pytest.fixture(autouse=True)
 def no_real_camera_list(monkeypatch):
-    """Keep tests independent of the cameras attached to this Mac."""
+    """Keep tests independent of the cameras attached to this machine."""
     monkeypatch.setattr(vanish_cam, "camera_names", lambda: [])

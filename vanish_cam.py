@@ -90,7 +90,8 @@ GESTURE_HINTS = {
     "itachi": "Cross your arms over your chest",
     "snap": "Snap your fingers to vanish",
 }
-SETTINGS_PATH = (Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config")
+SETTINGS_PATH = (Path(os.environ.get("APPDATA") if os.name == "nt" and os.environ.get("APPDATA")
+                      else os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config")
                  / "vanishcam" / "settings.json")
 
 CALIBRATION_SECONDS = 4.0
@@ -146,14 +147,16 @@ def acquire_instance_lock() -> bool:
     global _instance_lock
     if _instance_lock is not None:
         return True
-    try:
-        import fcntl
-    except ImportError:
-        return True
     import tempfile
-    handle = open(Path(tempfile.gettempdir()) / "vanishcam.lock", "w")
+    # Append mode: truncating a file another process has locked fails on Windows.
+    handle = open(Path(tempfile.gettempdir()) / "vanishcam.lock", "a")
     try:
-        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        if os.name == "nt":
+            import msvcrt
+            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except OSError:
         handle.close()
         return False
@@ -228,8 +231,25 @@ def set_window_topmost(title: str) -> None:
         pass
 
 
+def linux_camera_names(root: Path = Path("/sys/class/video4linux")) -> list[str]:
+    """Names of /dev/video<N> by N, which is OpenCV's camera index on Linux."""
+    found: dict[int, str] = {}
+    for node in root.glob("video*"):
+        number = node.name.removeprefix("video")
+        if number.isdigit():
+            try:
+                found[int(number)] = (node / "name").read_text().strip()
+            except OSError:
+                found[int(number)] = node.name
+    if not found:
+        return []
+    return [found.get(index, f"video{index}") for index in range(max(found) + 1)]
+
+
 def camera_names() -> list[str]:
-    """Camera names in OpenCV's index order (AVFoundation's device list), or [] if unknown."""
+    """Camera names in OpenCV's index order, or [] if unknown (Windows)."""
+    if platform.system() == "Linux":
+        return linux_camera_names()
     if platform.system() != "Darwin":
         return []
     try:
@@ -267,9 +287,12 @@ def camera_names() -> list[str]:
         return []
 
 
+VIRTUAL_CAMERA_MARKERS = ("virtual", "loopback", "dummy video device")
+
+
 def is_virtual_camera(name: str) -> bool:
-    """VanishCam's own output (OBS Virtual Camera) must never become its input."""
-    return "virtual" in name.lower()
+    """VanishCam's own output (OBS Virtual Camera, v4l2loopback) must never become its input."""
+    return any(marker in name.lower() for marker in VIRTUAL_CAMERA_MARKERS)
 
 
 class CameraSwitcher:
@@ -339,6 +362,17 @@ class VirtualCameraMissing(RuntimeError):
     """The OBS Virtual Camera driver is not installed, so retrying cannot help."""
 
 
+DRIVER_MISSING_MESSAGES = (
+    "not installed",                          # macOS OBS
+    "OBS Virtual Camera device not found",    # Windows OBS
+    "No v4l2 loopback device found",          # Linux
+)
+
+
+def driver_missing(error: str) -> bool:
+    return any(message in error for message in DRIVER_MISSING_MESSAGES)
+
+
 def open_virtual_camera(args: argparse.Namespace, width: int, height: int, quiet: bool = False):
     if getattr(args, "virtual_camera", None) is False:
         return None
@@ -352,16 +386,20 @@ def open_virtual_camera(args: argparse.Namespace, width: int, height: int, quiet
             device=getattr(args, "virtual_device", None),
         )
     except (ImportError, RuntimeError, OSError, ValueError) as error:
-        if "not installed" in str(error) and not virtual_camera_required(args):
+        if driver_missing(str(error)) and not virtual_camera_required(args):
             raise VirtualCameraMissing(
-                "No OBS Virtual Camera driver installed; video stays in the preview. "
-                "See the README for the one-time OBS setup.") from error
+                "No virtual camera driver installed; video stays in the preview. "
+                "See the README for the one-time setup.") from error
         if platform.system() == "Darwin":
             advice = ("Quit the OBS app (its own virtual camera blocks VanishCam). If OBS is not "
                       "installed: brew install --cask obs, then click 'Start Virtual Camera' "
                       "in OBS once to approve the driver.")
+        elif platform.system() == "Windows":
+            advice = ("Quit the OBS app (its own virtual camera blocks VanishCam). If OBS is not "
+                      "installed, install OBS Studio 30 or later.")
         else:
-            advice = "Install OBS Studio (OBS Virtual Camera driver) or v4l2loopback on Linux."
+            advice = ("Load v4l2loopback: sudo modprobe v4l2loopback devices=1 exclusive_caps=1 "
+                      "card_label='VanishCam Virtual Camera'.")
         message = f"Virtual webcam unavailable. {advice} Details: {error}"
         if virtual_camera_required(args):
             raise RuntimeError(message) from error

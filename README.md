@@ -1,21 +1,23 @@
-# VanishCam for macOS
+# VanishCam
 
 Vanish from your webcam with a hand gesture, live in Google Meet, Zoom or any app that
-uses a camera. Video is processed locally; nothing is recorded or uploaded.
+uses a camera. Video is processed locally; nothing is recorded or uploaded. Runs on
+macOS, Linux and Windows from source: no installers or executables.
 
-macOS fork of [Nicovic17/vanish_webcam](https://github.com/Nicovic17/vanish_webcam):
+Fork of [Nicovic17/vanish_webcam](https://github.com/Nicovic17/vanish_webcam):
 English UI, everything switchable live (effect, camera, background), preview-only overlay,
-direct virtual-camera output, and no Windows/EXE/licensing parts.
+direct virtual-camera output, and no EXE/licensing parts.
 
 ## Requirements
 
-- macOS on Apple Silicon or Intel
-- [Homebrew](https://brew.sh)
+- macOS (Apple Silicon or Intel), Linux (x86_64 or arm64) or Windows 10/11 (x86_64)
 - Python 3.11–3.13 (MediaPipe has no wheels for newer versions yet)
-- The OBS Virtual Camera driver (installed with OBS Studio) to appear as a camera in
-  Meet, Zoom, FaceTime and other apps
+- A virtual camera driver, so Meet, Zoom and other apps can pick VanishCam as a camera:
+  OBS Virtual Camera on macOS and Windows, v4l2loopback on Linux (setup below)
 
 ## Install
+
+macOS:
 
 ```sh
 brew install python@3.12
@@ -24,19 +26,73 @@ cd vanishcam-mac
 ./vanishcam
 ```
 
-The first `./vanishcam` run creates `.venv`, installs the dependencies from
-`requirements.txt` (prebuilt wheels only) and downloads the missing MediaPipe models from
-Google's `storage.googleapis.com/mediapipe-models` bucket. Later runs start immediately.
+Linux (Debian/Ubuntu; use your distribution's packages elsewhere):
 
-macOS asks for **camera access** for your terminal on the first run; allow it in
-**System Settings → Privacy & Security → Camera**.
+```sh
+sudo apt install python3 python3-venv git libgl1
+git clone https://github.com/jakub-tucek/vanishcam-mac.git
+cd vanishcam-mac
+./vanishcam
+```
 
-You can also double-click `VanishCam.command` in Finder.
+Windows: install Python 3.12 from [python.org](https://www.python.org/downloads/)
+(keep the *py launcher* option on), then in PowerShell or Command Prompt:
+
+```bat
+git clone https://github.com/jakub-tucek/vanishcam-mac.git
+cd vanishcam-mac
+vanishcam
+```
+
+The first run creates `.venv`, installs the dependencies from `requirements.txt` (prebuilt
+wheels only) and downloads the missing MediaPipe models from Google's
+`storage.googleapis.com/mediapipe-models` bucket. Later runs start immediately. The
+launchers (`vanishcam` for macOS/Linux, `vanishcam.cmd` for Windows) only pick a Python;
+the setup itself is `bootstrap.py`.
+
+Camera access:
+- **macOS** asks on the first run; allow your terminal in **System Settings → Privacy &
+  Security → Camera**. You can also double-click `VanishCam.command` in Finder.
+- **Windows**: **Settings → Privacy & security → Camera → Let desktop apps access your
+  camera** must be on. You can also double-click `vanishcam.cmd`.
+- **Linux**: your user needs access to `/dev/video*` (usually the `video` group:
+  `sudo usermod -aG video $USER`, then log out and in).
 
 ## Virtual camera setup (one-time)
 
-VanishCam sends its video to the **OBS Virtual Camera** driver, which every app sees as a
-camera. Only the driver is needed; the OBS app stays closed while VanishCam runs. macOS
+VanishCam sends its video to a virtual camera driver, which every app sees as a camera.
+
+### Linux: v4l2loopback
+
+```sh
+sudo apt install v4l2loopback-dkms
+sudo modprobe v4l2loopback devices=1 exclusive_caps=1 card_label="VanishCam Virtual Camera"
+```
+
+`exclusive_caps=1` is needed for Chrome (Meet) to list the camera. To load it on every
+boot:
+
+```sh
+echo v4l2loopback | sudo tee /etc/modules-load.d/v4l2loopback.conf
+echo 'options v4l2loopback devices=1 exclusive_caps=1 card_label="VanishCam Virtual Camera"' \
+  | sudo tee /etc/modprobe.d/v4l2loopback.conf
+```
+
+In Meet or Zoom pick **VanishCam Virtual Camera**. `C` never switches VanishCam's input to
+it (names containing *virtual*, *loopback* or *Dummy video device* are skipped).
+
+### Windows: OBS Virtual Camera
+
+Install [OBS Studio](https://obsproject.com) 30 or later; its installer registers the
+**OBS Virtual Camera** driver. Keep the OBS app closed while VanishCam runs (its own
+virtual camera would hold the driver). In Meet or Zoom pick **OBS Virtual Camera**.
+
+Windows gives VanishCam no camera names, so `C` cannot recognise the OBS Virtual Camera
+by name. If the preview ever shows itself (a picture inside a picture), press `C` again.
+
+### macOS: OBS Virtual Camera
+
+Only the driver is needed; the OBS app stays closed while VanishCam runs. macOS
 cannot install that driver without OBS.app, and a self-made driver would need a paid
 Apple Developer account.
 
@@ -48,7 +104,7 @@ Apple Developer account.
 5. If Meet later shows a black picture from *OBS Virtual Camera*, restart the Mac once;
    freshly approved camera extensions sometimes need it.
 
-### Optional: shrink OBS to just the driver (~487 MB → ~5 MB)
+#### Optional (macOS): shrink OBS to just the driver (~487 MB → ~5 MB)
 
 Once the driver is approved, macOS runs its own copy from `/Library/SystemExtensions/`,
 so OBS's bundled frameworks are no longer needed. If you never use OBS itself, you can
@@ -77,8 +133,10 @@ installed it disappears.
 2. Step out of the frame for 4 seconds while the empty background is captured. If you sit
    in a chair, leave the empty chair in place.
 3. Step back in and do the gesture shown at the top of the preview.
-4. In Meet, Zoom or FaceTime pick the camera **OBS Virtual Camera**. The badge at the top
-   right of the preview says **Live: OBS Virtual Camera** when frames are flowing.
+4. In Meet, Zoom or FaceTime pick the virtual camera (**OBS Virtual Camera**, or your
+   v4l2loopback device on Linux). The badge at the top right of the preview says
+   **Live: …** when frames are flowing. On Windows run `vanishcam` instead of `./vanishcam`
+   in the examples below.
 
 | Key | Effect | Gesture |
 | --- | --- | --- |
@@ -109,7 +167,7 @@ vanished the whole frame shows the chosen background.
 
 To reuse a background you generated in Google Meet: apply it in Meet, step out of the
 frame so only the background shows in your self-view, and take a screenshot of it
-(`Cmd+Shift+4`, then crop). Meet does not offer a download, so this is a 720p-ish copy.
+(`Cmd+Shift+4` on macOS, `Win+Shift+S` on Windows, then crop). Meet does not offer a download, so this is a 720p-ish copy.
 
 ### Controls
 
@@ -118,11 +176,11 @@ at the bottom of the preview are clickable too.
 
 | Key | Action |
 | --- | --- |
-| `1`–`5` | Switch effect (the captured background is kept) |
+| `1`–`6` | Switch effect (the captured background is kept) |
 | `G` | Gestures on/off: when off nothing triggers by itself; use `V` / `R` (Goku too) |
 | `V` / `R` | Vanish / reappear manually (in Goku only while gestures are off) |
 | `Space` | Recapture the empty room (step out of frame) |
-| `C` | Next camera (skips the OBS Virtual Camera, VanishCam's own output) |
+| `C` | Next camera (skips VanishCam's own virtual camera where the OS names cameras) |
 | `B` | Background: off → blur → your images |
 | `M` | Effect sounds on/off (remembered; `--mute` starts muted) |
 | `F` | Fullscreen |
@@ -139,7 +197,7 @@ orientation (the preview is mirrored, like a mirror).
 ./vanishcam --goku-delay 1           # Goku hold time in seconds (default 0.3)
 ./vanishcam --background blur        # off, blur, or an image (default: last choice)
 ./vanishcam --no-gestures            # start with gestures off (G turns them on)
-./vanishcam --no-virtual-camera      # skip the OBS driver
+./vanishcam --no-virtual-camera      # skip the virtual camera
 ./vanishcam --virtual-camera         # exit if the virtual camera is unavailable
 ./vanishcam --no-hud                 # plain preview
 ./vanishcam --no-mirror              # unmirrored preview
@@ -151,14 +209,16 @@ orientation (the preview is mirrored, like a mirror).
 
 | Problem | Fix |
 | --- | --- |
-| Badge says *Virtual camera busy* | Quit OBS: its own virtual camera holds the driver. VanishCam retries every 3 s. |
+| Badge says *Virtual camera busy* | Quit OBS (macOS/Windows) or the other app writing to the loopback device (Linux). VanishCam retries every 3 s. |
 | Badge says *No virtual camera driver* | Do the one-time virtual camera setup above. |
-| Meet shows black from *OBS Virtual Camera* | Select the camera again or reload the tab; fully quit and reopen Chrome; restart the Mac once after first installing OBS. |
-| Meet shows the plain webcam | Meet is set to *MacBook Pro Camera*; pick *OBS Virtual Camera*. |
+| Meet shows black from the virtual camera | Select the camera again or reload the tab; fully quit and reopen Chrome; on macOS restart once after first installing OBS. |
+| Chrome doesn't list the camera (Linux) | Reload v4l2loopback with `exclusive_caps=1` (see setup). |
+| *Could not access /dev/videoN due to missing permissions* (Linux) | Add yourself to the `video` group and log in again. |
+| Meet shows the plain webcam | Meet is set to your real camera; pick the virtual one. |
 | *Already running* | Another VanishCam window is open; press `Q` there. |
 | *No hand in view* | Hold the gesture higher, around face height, palm towards the camera. |
 | You stay visible after vanishing | Press `Space` and stay fully out of frame for the 4-second capture. |
-| Windows don't appear | They may open behind the terminal; check `Cmd+Tab` for Python. |
+| Windows don't appear | They may open behind the terminal; check `Cmd+Tab` / `Alt+Tab` for Python. |
 
 ## Development
 
@@ -168,7 +228,10 @@ orientation (the preview is mirrored, like a mirror).
 ./vanishcam --self-test   # checks models, assets and audio without opening a camera
 ```
 
-Layout: `vanish_cam.py` (app, overlay, camera switching), `*_effect.py` (effects),
+GitHub Actions runs the launcher, the tests and `--self-test` on Linux, Windows and macOS
+(`.github/workflows/tests.yml`).
+
+Layout: `bootstrap.py` (venv setup), `vanish_cam.py` (app, overlay, camera switching), `*_effect.py` (effects),
 `vanish_sound.py`, `mediapipe_log_filter.py` (quiets MediaPipe logs), `backgrounds/`, `models/`,
 `assets/`, `tests/`.
 
@@ -176,4 +239,4 @@ Layout: `vanish_cam.py` (app, overlay, camera switching), `*_effect.py` (effects
 
 Based on [Nicovic17/vanish_webcam](https://github.com/Nicovic17/vanish_webcam). Uses
 Google MediaPipe models (selfie segmenter, gesture recognizer, hand landmarker,
-BlazeFace).
+pose landmarker, BlazeFace).

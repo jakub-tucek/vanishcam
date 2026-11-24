@@ -42,19 +42,38 @@ class VirtualCameraTests(unittest.TestCase):
                     app.open_virtual_camera(arguments(**options), 640, 480)
 
     def test_missing_driver_is_reported_without_retrying(self):
+        errors = {
+            "macOS": "'obs' backend: OBS Virtual Camera is not installed",
+            "Windows": "'obs' backend: OBS Virtual Camera device not found! Did you install OBS?",
+            "Linux": "'v4l2loopback' backend: No v4l2 loopback device found at /dev/video[0-99].",
+        }
+        for system, message in errors.items():
+            with self.subTest(system):
+                module = SimpleNamespace(Camera=Mock(side_effect=RuntimeError(message)),
+                                         PixelFormat=SimpleNamespace(BGR="BGR"))
+                with patch.dict("sys.modules", pyvirtualcam=module):
+                    with self.assertRaisesRegex(app.VirtualCameraMissing, "No virtual camera driver"):
+                        app.open_virtual_camera(arguments(), 640, 480)
+                    with ExitStack() as resources, patch("builtins.print"):
+                        outputs = app.VideoOutputs(arguments(), resources)
+                        frame = np.zeros((24, 40, 3), np.uint8)
+                        outputs.send(frame, 0.0)
+                        outputs.send(frame, 10.0)
+                self.assertEqual(module.Camera.call_count, 2)  # Direct call plus one attempt.
+                self.assertEqual(outputs.badge(),
+                                 ("No virtual camera driver (see README)", app.HUD_WARN))
+
+    def test_busy_driver_keeps_retrying(self):
         module = SimpleNamespace(
-            Camera=Mock(side_effect=RuntimeError("'obs' backend: OBS Virtual Camera is not installed")),
+            Camera=Mock(side_effect=RuntimeError("'v4l2loopback' backend: Device /dev/video2 is already in use.")),
             PixelFormat=SimpleNamespace(BGR="BGR"))
-        with patch.dict("sys.modules", pyvirtualcam=module):
-            with self.assertRaisesRegex(app.VirtualCameraMissing, "No OBS Virtual Camera driver"):
-                app.open_virtual_camera(arguments(), 640, 480)
-            with ExitStack() as resources, patch("builtins.print"):
+        with patch.dict("sys.modules", pyvirtualcam=module), patch("builtins.print"):
+            with ExitStack() as resources:
                 outputs = app.VideoOutputs(arguments(), resources)
                 frame = np.zeros((24, 40, 3), np.uint8)
-                outputs.send(frame, 0.0)
-                outputs.send(frame, 10.0)
-        self.assertEqual(module.Camera.call_count, 2)  # The direct call plus one attempt, no retries.
-        self.assertEqual(outputs.badge(), ("No virtual camera driver (see README)", app.HUD_WARN))
+                for now in (0.0, 4.0, 8.0):
+                    outputs.send(frame, now)
+        self.assertEqual(module.Camera.call_count, 3)
 
     def test_disabled_camera_does_not_open_device(self):
         module = SimpleNamespace(Camera=Mock())

@@ -1,33 +1,16 @@
 #!/usr/bin/env bash
+# macOS and Linux launcher. Windows: vanishcam.cmd. Setup lives in bootstrap.py.
 set -euo pipefail
 
 cd "$(dirname "$0")"
 
-# The stamp is written only after a successful install, so an interrupted or failed
-# first run is retried instead of leaving a half-installed .venv behind.
-stamp=".venv/.requirements.sha256"
-wanted="$(shasum -a 256 requirements.txt | cut -d' ' -f1)"
-
-if [[ ! -x .venv/bin/python ]]; then
-  python=""
-  for candidate in python3.12 python3.13 python3.11; do
-    if command -v "$candidate" >/dev/null 2>&1; then
-      python="$candidate"
-      break
-    fi
-  done
-  if [[ -z "$python" ]]; then
-    echo "[VanishCam] Python 3.11-3.13 is required (brew install python@3.12)." >&2
-    exit 1
+for candidate in .venv/bin/python python3.12 python3.13 python3.11 python3; do
+  if command -v "$candidate" >/dev/null 2>&1 \
+      && "$candidate" -c 'import sys; sys.exit(not (3, 11) <= sys.version_info[:2] <= (3, 13))' 2>/dev/null; then
+    exec "$candidate" bootstrap.py "$@"
   fi
-  echo "[VanishCam] First run: creating .venv with $python..."
-  "$python" -m venv .venv
-fi
+done
 
-if [[ "$(cat "$stamp" 2>/dev/null)" != "$wanted" ]]; then
-  echo "[VanishCam] Installing dependencies..."
-  .venv/bin/pip install --quiet --disable-pip-version-check --only-binary=:all: -r requirements.txt
-  echo "$wanted" > "$stamp"
-fi
-
-exec .venv/bin/python vanish_cam.py "$@"
+echo "[VanishCam] Python 3.11-3.13 is required." >&2
+echo "  macOS: brew install python@3.12   Ubuntu/Debian: sudo apt install python3 python3-venv" >&2
+exit 1

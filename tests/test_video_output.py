@@ -40,19 +40,20 @@ class VirtualCameraTests(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, "driver missing"):
                     app.open_virtual_camera(arguments(**options), 640, 480)
 
-    def test_missing_driver_is_reported_briefly_without_failing(self):
+    def test_missing_driver_is_reported_without_retrying(self):
         module = SimpleNamespace(
             Camera=Mock(side_effect=RuntimeError("'obs' backend: OBS Virtual Camera is not installed")),
             PixelFormat=SimpleNamespace(BGR="BGR"))
-        with patch.dict("sys.modules", pyvirtualcam=module), patch("builtins.print") as printed:
-            self.assertIsNone(app.open_virtual_camera(arguments(), 640, 480))
-        self.assertIn("No OBS Virtual Camera driver installed", printed.call_args.args[0])
-
-    def test_browser_output_is_opt_in(self):
-        with patch("sys.argv", ["vanish_cam.py"]):
-            self.assertFalse(app.parse_args().browser)
-        with patch("sys.argv", ["vanish_cam.py", "--browser"]):
-            self.assertTrue(app.parse_args().browser)
+        with patch.dict("sys.modules", pyvirtualcam=module):
+            with self.assertRaisesRegex(app.VirtualCameraMissing, "No OBS Virtual Camera driver"):
+                app.open_virtual_camera(arguments(), 640, 480)
+            with ExitStack() as resources, patch("builtins.print"):
+                outputs = app.VideoOutputs(arguments(), resources)
+                frame = np.zeros((24, 40, 3), np.uint8)
+                outputs.send(frame, 0.0)
+                outputs.send(frame, 10.0)
+        self.assertEqual(module.Camera.call_count, 2)  # The direct call plus one attempt, no retries.
+        self.assertEqual(outputs.badge(), ("No virtual camera driver (see README)", app.HUD_WARN))
 
     def test_disabled_camera_does_not_open_device(self):
         module = SimpleNamespace(Camera=Mock())
@@ -207,7 +208,7 @@ class VideoOutputsTests(unittest.TestCase):
         outputs.send(frame, 0.0)
         outputs.send(frame, 1.0)  # Too early for a retry.
         self.assertEqual(self.opening.call_count, 1)
-        self.assertEqual(outputs.badge(), ("Preview only", app.HUD_IDLE))
+        self.assertEqual(outputs.badge(), ("Virtual camera busy (quit OBS?)", app.HUD_WARN))
         outputs.send(frame, 3.1)
         self.assertEqual(self.opening.call_count, 2)
         camera.send.assert_called_once()
@@ -219,13 +220,7 @@ class VideoOutputsTests(unittest.TestCase):
         outputs.send(frame, 0.0)
         outputs.send(frame, 10.0)
         self.assertEqual(self.opening.call_count, 1)
-
-    def test_badge_names_a_browser_stream_not_meet(self):
-        outputs = self.outputs([None])
-        outputs.browser = Mock(connected=True)
-        self.assertEqual(outputs.badge(), ("Live: browser stream", app.HUD_LIVE))
-        outputs.browser.connected = False
-        self.assertIn("Waiting for Meet", outputs.badge()[0])
+        self.assertEqual(outputs.badge(), ("Preview only", app.HUD_IDLE))
 
 
 class LoopControlTests(unittest.TestCase):

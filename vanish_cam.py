@@ -40,7 +40,6 @@ from naruto_effect import (
     load_log, overlay_log, render_substitution, substitution_anchor,
 )
 from vanish_sound import SOUND_PATH, TELEPORT_SOUND_PATH, VanishSound
-from browser_output import DEFAULT_PORT as BROWSER_PORT, BrowserOutput
 
 
 APP_DIR = Path(__file__).resolve().parent
@@ -192,11 +191,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--hud", action=argparse.BooleanOptionalAction, default=True,
         help="Status overlay in the preview window only; never sent to the virtual camera",
-    )
-    parser.add_argument(
-        "--browser", action="store_true",
-        help="Serve video to the VanishCam browser extension on 127.0.0.1. Any local "
-             "program can read it while enabled, so it is off by default",
     )
     parser.add_argument(
         "--goku-delay", type=positive_seconds, default=None,
@@ -422,6 +416,10 @@ def virtual_camera_required(args: argparse.Namespace) -> bool:
                 or getattr(args, "virtual_backend", None) or getattr(args, "virtual_device", None))
 
 
+class VirtualCameraMissing(RuntimeError):
+    """The OBS Virtual Camera driver is not installed, so retrying cannot help."""
+
+
 def open_virtual_camera(args: argparse.Namespace, width: int, height: int, quiet: bool = False):
     if getattr(args, "virtual_camera", None) is False:
         return None
@@ -436,10 +434,9 @@ def open_virtual_camera(args: argparse.Namespace, width: int, height: int, quiet
         )
     except (ImportError, RuntimeError, OSError, ValueError) as error:
         if "not installed" in str(error) and not virtual_camera_required(args):
-            if not quiet:
-                print("[Webcam] No OBS Virtual Camera driver installed; desktop apps won't see "
-                      "VanishCam (use --browser for Meet).")
-            return None
+            raise VirtualCameraMissing(
+                "No OBS Virtual Camera driver installed; video stays in the preview. "
+                "See the README for the one-time OBS setup.") from error
         if platform.system() == "Darwin":
             advice = ("Quit the OBS app (its own virtual camera blocks VanishCam). If OBS is not "
                       "installed: brew install --cask obs, then click 'Start Virtual Camera' "
@@ -463,7 +460,7 @@ def send_virtual_frame(camera, frame: np.ndarray) -> None:
 
 
 class VideoOutputs:
-    """Where the clean video goes: the virtual camera driver and the optional browser stream."""
+    """Sends the clean video to the OBS virtual camera, retrying while the driver is busy."""
 
     RETRY_SECONDS = 3.0
 
@@ -471,31 +468,26 @@ class VideoOutputs:
         self.args = args
         self.resources = resources
         self.virtual_camera = None
+        self.driver_missing = False
         self._attempts = 0
         self._retry_at: float | None = 0.0
-        self.browser: BrowserOutput | None = None
-        if getattr(args, "browser", False):
-            try:
-                self.browser = BrowserOutput(BROWSER_PORT)
-            except OSError as error:
-                print(f"[Webcam] Browser output unavailable (port {BROWSER_PORT} busy?): {error}")
-            else:
-                resources.callback(self.browser.close)
-                print(f"[Webcam] Browser output on 127.0.0.1:{BROWSER_PORT}; "
-                      "local programs can read this video while VanishCam runs.")
 
     def send(self, frame: np.ndarray, now: float) -> None:
         if self._retry_at is not None and now >= self._retry_at:
             self._open_virtual_camera(frame, now)
         if self.virtual_camera is not None:
             send_virtual_frame(self.virtual_camera, frame)
-        if self.browser is not None:
-            self.browser.publish(frame)
 
     def _open_virtual_camera(self, frame: np.ndarray, now: float) -> None:
         height, width = frame.shape[:2]
-        self.virtual_camera = open_virtual_camera(self.args, width, height, quiet=self._attempts > 0)
         self._attempts += 1
+        try:
+            self.virtual_camera = open_virtual_camera(self.args, width, height, quiet=self._attempts > 1)
+        except VirtualCameraMissing as error:
+            print(f"[Webcam] {error}")
+            self.driver_missing = True
+            self._retry_at = None
+            return
         if self.virtual_camera is not None:
             self.resources.callback(self.virtual_camera.close)
             self._retry_at = None
@@ -505,15 +497,12 @@ class VideoOutputs:
             self._retry_at = None
 
     def badge(self) -> tuple[str, tuple[int, int, int]]:
-        live = []
-        if self.browser is not None and self.browser.connected:
-            live.append("browser stream")
         if self.virtual_camera is not None:
-            live.append(self.virtual_camera.device)
-        if live:
-            return "Live: " + " + ".join(live), HUD_LIVE
-        if self.browser is not None:
-            return "Waiting for Meet: pick camera 'VanishCam'", HUD_IDLE
+            return f"Live: {self.virtual_camera.device}", HUD_LIVE
+        if self.driver_missing:
+            return "No virtual camera driver (see README)", HUD_WARN
+        if self._retry_at is not None:
+            return "Virtual camera busy (quit OBS?)", HUD_WARN
         return "Preview only", HUD_IDLE
 
 

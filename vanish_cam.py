@@ -198,6 +198,10 @@ def parse_args() -> argparse.Namespace:
         help="Status overlay in the preview window only; never sent to the virtual camera",
     )
     parser.add_argument(
+        "--mute", action=argparse.BooleanOptionalAction, default=None,
+        help="Effect sounds off (M toggles while running). Default: last choice",
+    )
+    parser.add_argument(
         "--gestures", action=argparse.BooleanOptionalAction, default=True,
         help="Gesture triggers (G toggles while running); without them use V and R",
     )
@@ -1103,7 +1107,7 @@ def _hud_box(image, x0, y0, x1, y1, color=None) -> None:
 
 HUD_HELP_ITEMS = (
     ("V vanish", "v"), ("R reappear", "r"), ("SPACE recapture room", " "),
-    ("G gestures", "g"), ("B background", "b"), ("C camera", "c"), ("F fullscreen", "f"),
+    ("G gestures", "g"), ("M sound", "m"), ("B background", "b"), ("C camera", "c"), ("F fullscreen", "f"),
     ("H hide help", "h"), ("Q quit", "q"),
 )
 
@@ -1242,13 +1246,16 @@ def run() -> int:
     if getattr(args, "self_test", False):
         return self_test()
     needs_settings = args.mode is None or args.camera is None or (
-        hasattr(args, "background") and args.background is None)
+        hasattr(args, "background") and args.background is None) or (
+        hasattr(args, "mute") and args.mute is None)
     settings = load_settings() if needs_settings else {}
     mode = args.mode or (settings.get("mode") if settings.get("mode") in ALL_MODES else "normal")
     if args.camera is None:
         remembered_camera = settings.get("camera")
         args.camera = remembered_camera if isinstance(remembered_camera, int) and \
             0 <= remembered_camera <= CameraSwitcher.MAX_INDEX else 0
+    if hasattr(args, "mute") and args.mute is None:
+        args.mute = settings.get("muted") is True
     if hasattr(args, "background") and args.background is None:
         remembered = settings.get("background")
         if remembered in ("off", "blur") or (isinstance(remembered, str)
@@ -1331,6 +1338,7 @@ def run_camera(args: argparse.Namespace, resources: ExitStack, mode: str) -> int
     last_gesture_report = 0.0
     hud_enabled = getattr(args, "hud", False)
     gestures_enabled = getattr(args, "gestures", True)
+    muted = bool(getattr(args, "mute", False))
     hud_help = True
     hud_detail = ""
     previous_now = 0.0
@@ -1352,6 +1360,10 @@ def run_camera(args: argparse.Namespace, resources: ExitStack, mode: str) -> int
         last_timestamp[0] = max(last_timestamp[0] + 1, timestamp_floor)
         return last_timestamp[0]
 
+    def play_sound() -> None:
+        if vanish_sound is not None and not muted:
+            vanish_sound.play()
+
     def teleport_goku(image: mp.Image) -> None:
         """Start Goku's teleport out of (or back into) the frame."""
         nonlocal goku_effect, goku_countdown_remaining
@@ -1362,7 +1374,7 @@ def run_camera(args: argparse.Namespace, resources: ExitStack, mode: str) -> int
         goku_effect = GokuTeleport(scene_frame, scene_background, mask)
         state.phase = "goku_appearing" if appearing else "goku_vanishing"
         state.vanish_started = time.perf_counter()
-        vanish_sound.play()
+        play_sound()
 
     def reset_effect() -> None:
         """Drop every in-progress effect; the captured background is kept."""
@@ -1389,8 +1401,8 @@ def run_camera(args: argparse.Namespace, resources: ExitStack, mode: str) -> int
 
     started = time.perf_counter()
     print("[Webcam] Step out of the frame for 4 seconds: capturing the background.")
-    print("[Webcam] Keys in the preview window: 1-5 effect, SPACE recapture room, "
-          "R reappear, V vanish, B background, C camera, F fullscreen, H help, Q quit.")
+    print("[Webcam] Keys in the preview window: 1-5 effect, SPACE recapture room, R reappear, "
+          "V vanish, G gestures, M sound, B background, C camera, F fullscreen, H help, Q quit.")
 
     raise_pending = True
     try:
@@ -1588,7 +1600,7 @@ def run_camera(args: argparse.Namespace, resources: ExitStack, mode: str) -> int
                                   f"{measures}")
                             last_gesture_report = now
                         if start_naruto_on_join(state, naruto_gate, joined, now):
-                            vanish_sound.play()
+                            play_sound()
 
                 if state.phase in ("vanishing", "naruto_vanishing"):
                     # Normal tracks the silhouette at 20 Hz. Particles captures
@@ -1653,7 +1665,7 @@ def run_camera(args: argparse.Namespace, resources: ExitStack, mode: str) -> int
                         state.phase == "vanished" and mode in ("goku", "itachi")) else "",
                     vcam_text, vcam_color, hud_help,
                     {"b": style.label, "c": switcher.label(args.camera),
-                     "g": "on" if gestures_enabled else "off"},
+                     "g": "on" if gestures_enabled else "off", "m": "off" if muted else "on"},
                 )
             cv2.imshow(WINDOW_NAME, preview)
             if raise_pending:
@@ -1683,6 +1695,12 @@ def run_camera(args: argparse.Namespace, resources: ExitStack, mode: str) -> int
                     state.phase = "ready"
             elif key in (ord("h"), ord("H")):
                 hud_help = not hud_help
+            elif key in (ord("m"), ord("M")):
+                muted = not muted
+                save_settings(muted=muted)
+                if muted and vanish_sound is not None:
+                    vanish_sound.stop()
+                print(f"[Webcam] Sound {'off' if muted else 'on'}.")
             elif key in (ord("g"), ord("G")):
                 gestures_enabled = not gestures_enabled
                 for gate in (itachi_gate, goku_gate, naruto_gate):
@@ -1743,7 +1761,7 @@ def run_camera(args: argparse.Namespace, resources: ExitStack, mode: str) -> int
                 state.phase = "naruto_vanishing" if mode == "naruto" else "vanishing"
                 state.vanish_started = time.perf_counter()
                 if mode == "naruto":
-                    vanish_sound.play()
+                    play_sound()
                     log_anchor = None
                 vanished_frame = None
                 particle_effect = None

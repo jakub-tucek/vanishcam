@@ -123,6 +123,7 @@ at the bottom of the preview are clickable too.
 | `Space` | Recapture the empty room (step out of frame) |
 | `C` | Next camera (skips the OBS Virtual Camera, VanishCam's own output) |
 | `B` | Background: off → blur → your images |
+| `M` | Effect sounds on/off (remembered; `--mute` starts muted) |
 | `F` | Fullscreen |
 | `H` | Hide or show the button bar |
 | `Q` / `Esc` | Quit |

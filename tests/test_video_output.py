@@ -293,6 +293,17 @@ class LoopControlTests(unittest.TestCase):
             recognizer=recognizer, extra=(teleport,))
         self.assertEqual([m for m in messages if m.startswith("[Goku]")], ["[Goku] Disappearance!"])
 
+    def test_m_mutes_effect_sounds(self):
+        for keys, plays in (((0, ord("m"), ord("v"), 0, ord("q")), 0),
+                            ((0, 0, ord("v"), 0, ord("q")), 1)):
+            with self.subTest(muted=bool(plays == 0)):
+                sound_class = Mock()
+                recognizer = Mock()
+                recognizer.recognize_joined_hands.return_value = False
+                self.run_loop("naruto", (0.1, 4.1, 4.3, 4.5, 4.7), keys, recognizer=recognizer,
+                              extra=(patch.object(app, "VanishSound", sound_class),))
+                self.assertEqual(sound_class.return_value.play.call_count, plays)
+
     def test_never_starts_on_its_own_virtual_camera(self):
         names = patch.object(app, "camera_names", return_value=["OBS Virtual Camera", "MacBook Pro Camera"])
         _, messages = self.run_loop("normal", (0.1, 0.2), (0, ord("q")), extra=(names,))

@@ -38,6 +38,20 @@ class VirtualCameraTests(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, "driver missing"):
                     app.open_virtual_camera(arguments(**options), 640, 480)
 
+    def test_missing_driver_is_reported_briefly_without_failing(self):
+        module = SimpleNamespace(
+            Camera=Mock(side_effect=RuntimeError("'obs' backend: OBS Virtual Camera is not installed")),
+            PixelFormat=SimpleNamespace(BGR="BGR"))
+        with patch.dict("sys.modules", pyvirtualcam=module), patch("builtins.print") as printed:
+            self.assertIsNone(app.open_virtual_camera(arguments(), 640, 480))
+        self.assertIn("No OBS Virtual Camera driver installed", printed.call_args.args[0])
+
+    def test_browser_output_is_opt_in(self):
+        with patch("sys.argv", ["vanish_cam.py"]):
+            self.assertFalse(app.parse_args().browser)
+        with patch("sys.argv", ["vanish_cam.py", "--browser"]):
+            self.assertTrue(app.parse_args().browser)
+
     def test_disabled_camera_does_not_open_device(self):
         module = SimpleNamespace(Camera=Mock())
         with patch.dict("sys.modules", pyvirtualcam=module):
@@ -144,6 +158,77 @@ class RunTests(unittest.TestCase):
         launcher.assert_called_once_with(app.ALL_MODES, "particles", 3, mirror=False)
         save.assert_called_once_with(mode="goku", camera=2)
         self.assertEqual(camera.call_args.args[0].camera, 2)
+
+
+class LoopControlTests(unittest.TestCase):
+    """Drive run_camera frame by frame: each frame read advances the fake clock."""
+
+    def run_loop(self, mode, times, keys, recognizer=None, person_mask=None, extra=()):
+        clock = [0.0]
+        frames = iter(times)
+
+        def read():
+            clock[0] = next(frames)
+            return True, np.full((80, 120, 3), 90, np.uint8)
+
+        capture = Mock()
+        capture.read.side_effect = read
+        recognizer = recognizer or Mock()
+        mask = np.zeros((80, 120), np.float32)
+        mask[20:70, 40:80] = 1.0
+        with ExitStack() as mocks:
+            mocks.enter_context(patch.object(app, "download_models"))
+            mocks.enter_context(patch.object(app, "open_camera", return_value=capture))
+            tasks = mocks.enter_context(patch.object(app, "create_tasks", return_value=(Mock(), recognizer)))
+            mocks.enter_context(patch.object(app, "open_virtual_camera", return_value=None))
+            mocks.enter_context(patch.object(app, "VanishSound"))
+            mocks.enter_context(patch.object(app, "person_mask", side_effect=person_mask or (lambda *a: mask)))
+            mocks.enter_context(patch.object(app, "recognize_gesture", return_value=("No_Hand", 0.0)))
+            mocks.enter_context(patch.object(app.time, "perf_counter", side_effect=lambda: clock[0]))
+            for name in ("namedWindow", "resizeWindow", "destroyAllWindows", "imshow"):
+                mocks.enter_context(patch.object(app.cv2, name))
+            mocks.enter_context(patch.object(app.cv2, "getWindowProperty", return_value=1))
+            mocks.enter_context(patch.object(app.cv2, "waitKey", side_effect=keys))
+            for target in extra:
+                mocks.enter_context(target)
+            printed = mocks.enter_context(patch("builtins.print"))
+            with ExitStack() as resources:
+                self.assertEqual(app.run_camera(arguments(mode=mode), resources, mode), 0)
+        messages = [c.args[0] for c in printed.call_args_list if c.args]
+        return tasks, messages
+
+    def test_timestamps_stay_strictly_increasing_within_one_frame(self):
+        stamps = []
+        recognizer = Mock()
+        recognizer.recognize_pose.side_effect = lambda image, ts, mask: stamps.append(ts) or False
+        mask = np.ones((80, 120), np.float32)
+        # Frame 3 runs the Itachi gesture check and handles V, both on the segmenter.
+        self.run_loop(
+            "itachi", (0.1, 4.1, 4.3, 4.5, 4.7), (0, 0, ord("v"), 0, ord("q")),
+            recognizer=recognizer,
+            person_mask=lambda segmenter, image, ts, w, h: stamps.append(ts) or mask,
+            extra=(patch.object(app, "ItachiCrowEffect"),),
+        )
+        self.assertGreaterEqual(len(stamps), 3)
+        self.assertEqual(stamps, sorted(set(stamps)))
+
+    def test_number_keys_switch_effect_and_load_its_models(self):
+        recognizer = Mock()
+        recognizer.recognize_joined_hands.return_value = False
+        tasks, messages = self.run_loop(
+            "normal", (0.1, 4.1, 4.3, 4.5, 4.7), (0, 0, ord("2"), 0, ord("q")), recognizer=recognizer)
+        self.assertEqual([c.args[0] for c in tasks.call_args_list], ["normal", "naruto"])
+        self.assertIn("[Webcam] Effect: Naruto", messages)
+
+    def test_switching_during_background_capture_keeps_capturing(self):
+        times = (0.1, 4.1, 4.3, 4.5) + tuple(4.9 + i * 0.4 for i in range(10))
+        keys = [0] * len(times)
+        keys[2] = ord(" ")
+        keys[3] = ord("3")
+        keys[-1] = ord("q")
+        _, messages = self.run_loop("normal", times, keys)
+        ready = [m for m in messages if m.startswith("[Webcam] Background ready")]
+        self.assertEqual(len(ready), 2)
 
 
 class MirrorTests(unittest.TestCase):

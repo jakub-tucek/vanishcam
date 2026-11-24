@@ -3,6 +3,11 @@ set -euo pipefail
 
 cd "$(dirname "$0")"
 
+# The stamp is written only after a successful install, so an interrupted or failed
+# first run is retried instead of leaving a half-installed .venv behind.
+stamp=".venv/.requirements.sha256"
+wanted="$(shasum -a 256 requirements.txt | cut -d' ' -f1)"
+
 if [[ ! -x .venv/bin/python ]]; then
   python=""
   for candidate in python3.12 python3.13 python3.11; do
@@ -12,12 +17,17 @@ if [[ ! -x .venv/bin/python ]]; then
     fi
   done
   if [[ -z "$python" ]]; then
-    echo "[VanishCam] Python 3.11+ is required (brew install python@3.12)." >&2
+    echo "[VanishCam] Python 3.11-3.13 is required (brew install python@3.12)." >&2
     exit 1
   fi
   echo "[VanishCam] First run: creating .venv with $python..."
   "$python" -m venv .venv
-  .venv/bin/pip install --quiet --only-binary=:all: -r requirements.txt
+fi
+
+if [[ "$(cat "$stamp" 2>/dev/null)" != "$wanted" ]]; then
+  echo "[VanishCam] Installing dependencies..."
+  .venv/bin/pip install --quiet --disable-pip-version-check --only-binary=:all: -r requirements.txt
+  echo "$wanted" > "$stamp"
 fi
 
 exec .venv/bin/python vanish_cam.py "$@"

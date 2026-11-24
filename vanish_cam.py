@@ -193,10 +193,10 @@ def parse_args() -> argparse.Namespace:
         help="Status overlay in the preview window only; never sent to the virtual camera",
     )
     parser.add_argument(
-        "--browser", action=argparse.BooleanOptionalAction, default=True,
-        help="Serve video to the VanishCam browser extension on 127.0.0.1 (default: on)",
+        "--browser", action="store_true",
+        help="Serve video to the VanishCam browser extension on 127.0.0.1. Any local "
+             "program can read it while enabled, so it is off by default",
     )
-    parser.add_argument("--browser-port", type=int, default=BROWSER_PORT, help=argparse.SUPPRESS)
     parser.add_argument(
         "--goku-delay", type=positive_seconds, default=None,
         help=f"Goku gesture hold time in seconds (default: {HOLD_SECONDS:g})",
@@ -377,6 +377,11 @@ def open_virtual_camera(args: argparse.Namespace, width: int, height: int, quiet
             device=getattr(args, "virtual_device", None),
         )
     except (ImportError, RuntimeError, OSError, ValueError) as error:
+        if "not installed" in str(error) and not virtual_camera_required(args):
+            if not quiet:
+                print("[Webcam] No OBS Virtual Camera driver installed; desktop apps won't see "
+                      "VanishCam (use --browser for Meet).")
+            return None
         if platform.system() == "Darwin":
             advice = ("Quit the OBS app (its own virtual camera blocks VanishCam). If OBS is not "
                       "installed: brew install --cask obs, then click 'Start Virtual Camera' "
@@ -567,6 +572,10 @@ def make_dissolve_fields(height: int, width: int) -> tuple[np.ndarray, np.ndarra
         + np.sin(x_normal * 18.0) * 0.025
     )
     return np.clip(field, 0.0, 1.0), fine_noise
+
+
+def to_mp_image(frame: np.ndarray) -> mp.Image:
+    return mp.Image(image_format=mp.ImageFormat.SRGB, data=cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
 
 
 def person_mask(
@@ -1110,11 +1119,13 @@ def run_camera(args: argparse.Namespace, resources: ExitStack, mode: str) -> int
     browser_output = None
     if getattr(args, "browser", False):
         try:
-            browser_output = BrowserOutput(getattr(args, "browser_port", BROWSER_PORT))
+            browser_output = BrowserOutput(BROWSER_PORT)
         except OSError as error:
-            print(f"[Webcam] Browser output unavailable (port {args.browser_port} busy?): {error}")
+            print(f"[Webcam] Browser output unavailable (port {BROWSER_PORT} busy?): {error}")
         else:
             resources.callback(browser_output.close)
+            print(f"[Webcam] Browser output on 127.0.0.1:{BROWSER_PORT}; "
+                  "local programs can read this video while VanishCam runs.")
     resources.callback(cv2.destroyAllWindows)
     cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
     cv2.resizeWindow(WINDOW_NAME, args.width, args.height)
@@ -1172,6 +1183,27 @@ def run_camera(args: argparse.Namespace, resources: ExitStack, mode: str) -> int
         last_timestamp[0] = max(last_timestamp[0] + 1, timestamp_floor)
         return last_timestamp[0]
 
+    def reset_effect() -> None:
+        """Drop every in-progress effect; the captured background is kept."""
+        nonlocal log_anchor, last_mask, last_mask_at, vanished_frame, particle_effect
+        nonlocal itachi_effect, goku_effect, goku_countdown_remaining, hud_detail
+        nonlocal hidden_base_source, hidden_base, hidden_mask, exposure_gain
+        state.vanish_started = None
+        log_anchor = None
+        last_mask = None
+        last_mask_at = float("-inf")
+        vanished_frame = None
+        particle_effect = None
+        itachi_effect = None
+        goku_effect = None
+        goku_countdown_remaining = None
+        hud_detail = ""
+        hidden_base_source = hidden_base = hidden_mask = exposure_gain = None
+        if itachi_gate is not None:
+            itachi_gate.reset()
+        if goku_gate is not None:
+            goku_gate.reset()
+
     started = time.perf_counter()
     print("[Webcam] Step out of the frame for 4 seconds: capturing the background.")
     print("[Webcam] Keys in the preview window: 1-5 effect, SPACE new background, "
@@ -1208,8 +1240,7 @@ def run_camera(args: argparse.Namespace, resources: ExitStack, mode: str) -> int
                     and state.phase in ("ready", "vanished")
                     and now - state.last_gesture_check >= 0.09):
                 state.last_gesture_check = now
-                rgb = cv2.cvtColor(camera_frame, cv2.COLOR_BGR2RGB)
-                mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+                mp_image = to_mp_image(camera_frame)
                 mask = person_mask(segmenter, mp_image, stamp(), width, height)
                 last_mask, last_mask_at = mask, now
                 touching = recognizer.recognize_pose(mp_image, stamp(), mask)
@@ -1234,8 +1265,7 @@ def run_camera(args: argparse.Namespace, resources: ExitStack, mode: str) -> int
                     and state.phase in ("ready", "vanished")
                     and now - state.last_gesture_check >= 0.10):
                 state.last_gesture_check = now
-                rgb = cv2.cvtColor(camera_frame, cv2.COLOR_BGR2RGB)
-                mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+                mp_image = to_mp_image(camera_frame)
                 pose = recognizer.recognize_pose(mp_image, stamp())
                 hud_detail = (f"Face seen: {'yes' if recognizer.last_face_count else 'no'}   "
                               f"hands: {recognizer.last_hand_count}   "
@@ -1320,8 +1350,7 @@ def run_camera(args: argparse.Namespace, resources: ExitStack, mode: str) -> int
                         hidden_mask = exposure_gain = None
                     if hidden_mask is None or now - last_mask_at >= 0.05:
                         if mp_image is None:
-                            rgb = cv2.cvtColor(camera_frame, cv2.COLOR_BGR2RGB)
-                            mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+                            mp_image = to_mp_image(camera_frame)
                         fresh = widen_mask(person_mask(segmenter, mp_image, stamp(), width, height))
                         # Hold the previous mask briefly so a missed frame cannot flash a limb.
                         hidden_mask = fresh if hidden_mask is None else np.maximum(fresh, hidden_mask * 0.8)
@@ -1342,8 +1371,7 @@ def run_camera(args: argparse.Namespace, resources: ExitStack, mode: str) -> int
                     (0.08 if mode == "naruto" else GESTURE_INTERVAL_SECONDS)
                 ):
                     state.last_gesture_check = now
-                    rgb = cv2.cvtColor(camera_frame, cv2.COLOR_BGR2RGB)
-                    mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+                    mp_image = to_mp_image(camera_frame)
                     if mode != "naruto":
                         name, score = recognize_gesture(recognizer, mp_image, stamp())
                         hud_detail = ("No hand in view" if name == "No_Hand"
@@ -1377,8 +1405,7 @@ def run_camera(args: argparse.Namespace, resources: ExitStack, mode: str) -> int
                     )
                     if needs_mask:
                         if mp_image is None:
-                            rgb = cv2.cvtColor(camera_frame, cv2.COLOR_BGR2RGB)
-                            mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+                            mp_image = to_mp_image(camera_frame)
                         mask = person_mask(segmenter, mp_image, stamp(), width, height)
                         last_mask = mask
                         last_mask_at = now
@@ -1400,7 +1427,7 @@ def run_camera(args: argparse.Namespace, resources: ExitStack, mode: str) -> int
                     display = particle_effect.render(background, age)
                     if age >= PARTICLE_SECONDS:
                         state.phase = "vanished"
-                        vanished_frame = display
+                        vanished_frame = background.copy()
                 elif state.phase == "ready":
                     display = camera_frame
                 else:
@@ -1440,7 +1467,8 @@ def run_camera(args: argparse.Namespace, resources: ExitStack, mode: str) -> int
                     preview, mode, ALL_MODES,
                     hud_status(mode, state.phase, calibration_remaining, goku_delay,
                                goku_countdown_remaining),
-                    hud_detail if state.phase in ("ready", "vanished") else "",
+                    hud_detail if state.phase == "ready" or (
+                        state.phase == "vanished" and mode in ("goku", "itachi")) else "",
                     vcam_text, vcam_color, hud_help,
                 )
             cv2.imshow(WINDOW_NAME, preview)
@@ -1462,43 +1490,21 @@ def run_camera(args: argparse.Namespace, resources: ExitStack, mode: str) -> int
                 segmenter, recognizer, log_sprite, vanish_sound = load_kit(mode)
                 itachi_gate = ItachiGestureGate() if mode == "itachi" else None
                 goku_gate = GokuGestureGate(hold_seconds=goku_delay) if mode == "goku" else None
-                if background is not None:
+                reset_effect()
+                if state.phase != "calibrating" and background is not None:
                     state.phase = "ready"
-                state.vanish_started = None
-                log_anchor = None
-                last_mask = None
-                last_mask_at = float("-inf")
-                vanished_frame = None
-                particle_effect = None
-                itachi_effect = None
-                goku_effect = None
-                goku_countdown_remaining = None
-                hud_detail = ""
             elif key in (ord("h"), ord("H")):
                 hud_help = not hud_help
             elif key == ord(" "):
+                reset_effect()
                 state.phase = "calibrating"
                 state.calibration_started = now
-                state.vanish_started = None
-                log_anchor = None
-                last_mask = None
-                last_mask_at = float("-inf")
-                vanished_frame = None
-                particle_effect = None
-                itachi_effect = None
-                if itachi_gate is not None:
-                    itachi_gate.reset()
-                goku_effect = None
-                if goku_gate is not None:
-                    goku_gate.reset()
-                    goku_countdown_remaining = None
                 background_samples.clear()
                 calibration_remaining = None
                 print("[Webcam] Step out of the frame for 4 seconds: capturing the new background.")
             elif key == ord("r"):
                 if background is not None and mode == "itachi" and state.phase == "vanished":
-                    rgb = cv2.cvtColor(camera_frame, cv2.COLOR_BGR2RGB)
-                    mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+                    mp_image = to_mp_image(camera_frame)
                     mask = person_mask(segmenter, mp_image, stamp(), width, height)
                     try:
                         itachi_effect = ItachiCrowEffect(camera_frame, mask)
@@ -1509,16 +1515,10 @@ def run_camera(args: argparse.Namespace, resources: ExitStack, mode: str) -> int
                         state.vanish_started = time.perf_counter()
                         vanished_frame = None
                 elif background is not None and mode not in ("goku", "itachi"):
+                    reset_effect()
                     state.phase = "ready"
-                    state.vanish_started = None
-                    vanished_frame = None
-                    log_anchor = None
-                    last_mask = None
-                    last_mask_at = float("-inf")
-                    particle_effect = None
             elif key == ord("v") and background is not None and mode == "itachi" and state.phase == "ready":
-                rgb = cv2.cvtColor(camera_frame, cv2.COLOR_BGR2RGB)
-                mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+                mp_image = to_mp_image(camera_frame)
                 mask = person_mask(segmenter, mp_image, stamp(), width, height)
                 try:
                     itachi_effect = ItachiCrowEffect(camera_frame, mask)

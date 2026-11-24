@@ -35,13 +35,18 @@ You can also double-click `VanishCam.command` in Finder.
 
 ## Google Meet in Chrome, no OBS (one-time)
 
-The `browser-extension/` folder adds a **VanishCam** camera to Google Meet. VanishCam
-serves its video only on `127.0.0.1`, only to `https://meet.google.com`, and only to
-requests from the extension; other websites cannot read it.
+The `browser-extension/` folder adds a **VanishCam** camera to Google Meet. With
+`--browser`, VanishCam serves its video on `127.0.0.1` to the extension on
+`https://meet.google.com`; other websites cannot read it.
+
+The server is **off by default**: while it runs, any program on your Mac (and other users
+logged into it) could read the processed video without macOS camera permission. Enable it
+only when you need Meet in the browser.
 
 1. Open `chrome://extensions`, turn on **Developer mode** (top right).
 2. Click **Load unpacked** and pick the `browser-extension` folder of this repo.
-3. Start `./vanishcam`, open Meet, and choose **Settings → Video → Camera → VanishCam**.
+3. Start `./vanishcam --browser`, open Meet, and choose
+   **Settings → Video → Camera → VanishCam**.
 4. Chrome asks once whether meet.google.com may access apps and services on this device:
    click **Allow**. (That is how the page reaches VanishCam on `127.0.0.1`.)
 
@@ -130,7 +135,7 @@ orientation (the preview is mirrored, like a mirror).
 ./vanishcam --mode goku --camera 0   # skip the launcher
 ./vanishcam --goku-delay 1           # Goku hold time in seconds (default 0.3)
 ./vanishcam --no-virtual-camera      # skip the OBS driver
-./vanishcam --no-browser             # don't serve the browser extension
+./vanishcam --browser                # serve the Meet browser extension (off by default)
 ./vanishcam --virtual-camera         # exit if the virtual camera is unavailable
 ./vanishcam --no-hud                 # plain preview
 ./vanishcam --no-mirror              # unmirrored preview
@@ -143,7 +148,7 @@ orientation (the preview is mirrored, like a mirror).
 | Problem | Fix |
 | --- | --- |
 | No *VanishCam* camera in Meet | Check the extension is enabled in `chrome://extensions`, then reload the Meet tab. |
-| Meet shows "Start the VanishCam app" | Start `./vanishcam`. If it is running, allow meet.google.com to access apps on this device (padlock icon → Site settings → Local network access). |
+| Meet shows "Start the VanishCam app" | Start `./vanishcam --browser`. If it is running, allow meet.google.com to access apps on this device (padlock icon → Site settings → Local network access). |
 | Meet shows the plain webcam | Meet is set to *MacBook Pro Camera*; pick *VanishCam*. |
 | Desktop app shows black from *OBS Virtual Camera* | Quit OBS (its own virtual camera holds the driver); restart the Mac once after first installing OBS. |
 | *Already running* | Another VanishCam window is open; press `Q` there. |

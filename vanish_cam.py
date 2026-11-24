@@ -1034,6 +1034,8 @@ def hud_status(mode: str, phase: str, calibration_remaining: int | None,
 
 def self_test() -> int:
     """Check bundled resources and model initialization without opening a webcam."""
+    for mode in ALL_MODES:
+        download_models(mode)
     required = [SEGMENTER_MODEL, GESTURE_MODEL, HAND_MODEL, FACE_MODEL, TELEPORT_SOUND_PATH,
                 CROW_SHEET_PATH, SHARINGAN_PATH, LOG_PATH, SOUND_PATH]
     missing = [path.name for path in required if not path.is_file()]

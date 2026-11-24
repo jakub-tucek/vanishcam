@@ -14,7 +14,6 @@ import urllib.request
 from dataclasses import dataclass, replace
 from contextlib import ExitStack
 from pathlib import Path
-from types import SimpleNamespace
 
 if __name__ == "__main__":
     from mediapipe_log_filter import needs_filter, run_local_filtered
@@ -998,84 +997,24 @@ class MultiViewGestureRecognizer:
             self.alternate.close()
 
 
-def view_to_frame(hands, rotation: int, crop: tuple[float, float, float, float]):
-    """Map landmarks found in a cropped, np.rot90-rotated view back to full-frame coordinates.
-
-    crop is (left, top, right, bottom) as fractions of the frame, so every seal check
-    (pointing up, inside the frame) is judged in the real camera image.
-    """
-    left, top, right, bottom = crop
-    mapped = []
-    for hand in hands:
-        points = []
-        for p in hand:
-            u, v = p.x, p.y
-            x, y = {0: (u, v), 1: (1 - v, u), 2: (1 - u, 1 - v), 3: (v, 1 - u)}[rotation % 4]
-            points.append(SimpleNamespace(x=left + x * (right - left), y=top + y * (bottom - top)))
-        mapped.append(points)
-    return mapped
-
-
 class MultiViewHandLandmarker:
-    """Track two hands in video and retry difficult views with the hand model."""
+    """Detect the Naruto seal with the video hand landmarker.
 
-    VIEWS = {"full": (0.0, 0.0, 1.0, 1.0), "center": (0.12, 0.18, 0.88, 1.0)}
+    Rotated and cropped retry views used to recover more hands, but the calibrated seal
+    check works on the plain frame and the retries mostly added false triggers and cost.
+    """
 
     def __init__(self, primary, alternate):
         self.primary = primary
         self.alternate = alternate
-        self.preferred_view: tuple[str, int] | None = None
-        self.next_retry_ms = 0
         self.last_hand_count = 0
         self.last_seal = HandSeal(hands=0)
-        self.retry_cursor = 0
-
-    def _check(self, result, rotation: int, crop, width: int, height: int) -> HandSeal:
-        hands = view_to_frame(result.hand_landmarks, rotation, crop)
-        seal = analyze_hand_seal(hands, width, height, getattr(result, "hand_world_landmarks", None))
-        self.last_hand_count = max(self.last_hand_count, len(result.hand_landmarks))
-        if seal.hands >= self.last_seal.hands:
-            self.last_seal = seal
-        return seal
 
     def recognize_joined_hands(self, image: mp.Image, timestamp_ms: int) -> bool:
         result = self.primary.detect_for_video(image, timestamp_ms)
-        self.last_hand_count = 0
-        self.last_seal = HandSeal(hands=0)
-        if self._check(result, 0, self.VIEWS["full"], image.width, image.height).ok:
-            self.preferred_view = None
-            return True
-        if timestamp_ms < self.next_retry_ms:
-            return False
-
-        rgb = image.numpy_view()
-        height, width = rgb.shape[:2]
-        # No bottom-corner crops: they mostly found hands resting in a lap.
-        attempts = [("full", rotation) for rotation in (1, 3, 2)]
-        attempts += [("center", rotation) for rotation in (0, 1, 3)]
-        selected = []
-        if self.preferred_view in attempts:
-            selected.append(self.preferred_view)
-        while len(selected) < 2:
-            view = attempts[self.retry_cursor % len(attempts)]
-            self.retry_cursor += 1
-            if view not in selected:
-                selected.append(view)
-        for crop, rotation in selected:
-            left, top, right, bottom = self.VIEWS[crop]
-            region = rgb[int(height * top):int(height * bottom), int(width * left):int(width * right)]
-            rotated = mp.Image(
-                image_format=mp.ImageFormat.SRGB,
-                data=np.ascontiguousarray(np.rot90(region, rotation)),
-            )
-            result = self.alternate.detect(rotated)
-            if self._check(result, rotation, self.VIEWS[crop], width, height).ok:
-                self.preferred_view = (crop, rotation)
-                self.next_retry_ms = timestamp_ms + 90
-                return True
-        self.preferred_view = None
-        self.next_retry_ms = timestamp_ms + 80
-        return False
+        self.last_hand_count = len(result.hand_landmarks)
+        self.last_seal = analyze_hand_seal(result.hand_landmarks, image.width, image.height)
+        return self.last_seal.ok
 
     def close(self) -> None:
         try:
@@ -1627,8 +1566,8 @@ def run_camera(args: argparse.Namespace, resources: ExitStack, mode: str) -> int
                         if args.gesture_debug and now - last_gesture_report >= 1.0:
                             measures = " ".join(f"{name}={value:.2f}" for name, value
                                                 in recognizer.last_seal.measures.items())
-                            print(f"[Hands] detected={recognizer.last_hand_count}, seal={joined}, "
-                                  f"view={recognizer.preferred_view or 'full'} {measures}")
+                            print(f"[Hands] detected={recognizer.last_hand_count}, seal={joined} "
+                                  f"{measures}")
                             last_gesture_report = now
                         if start_naruto_on_join(state, naruto_gate, joined, now):
                             vanish_sound.play()

@@ -18,42 +18,41 @@ FINGERS = ((5, 6, 7, 8), (9, 10, 11, 12), (13, 14, 15, 16), (17, 18, 19, 20))
 WRIST, MIDDLE_KNUCKLE = 0, 9
 PALM = (0, 5, 9, 13, 17)
 
-# Thresholds relative to hand length (wrist to middle knuckle), so they hold at any distance.
-STRAIGHT_MIN = 0.8        # Knuckle-to-tip chord vs path along the finger; curled ~0.5.
-TOGETHER_MAX = 0.4        # Widest gap between neighbouring fingertips; splayed ~0.6+.
-UP_MAX_DEGREES = 40.0     # Wrist-to-knuckle direction vs straight up in the image.
-PALMS_MAX = 0.6           # Distance between the two palm centres.
-TIPS_MAX = 0.7            # Distance between the two middle fingertips.
-SIZE_RATIO_MAX = 1.6      # The two hands must look about the same size.
+# Calibrated on labelled recordings (seal at chest and face vs one open hand, karate chop,
+# waving, hands apart, hands resting / on a knee). Distances are relative to hand length.
+# MediaPipe sees pressed palms either as two hands almost on top of each other, or merges
+# them into one hand that is narrow (seen side-on) and distorted. A real single hand is
+# never distorted that way, which is what keeps a raised hand or a wave from triggering.
+TILT_MAX = 30.0           # Degrees from straight up in the image.
+PAIR_PALMS_MAX = 0.7      # Two hands: distance between palm centres.
+MERGED_WIDTH_MAX = 0.45   # One hand: knuckle width (index to pinky), side-on is narrow.
+MERGED_GAP_MIN = 0.7      # One hand: widest neighbouring fingertip gap, distorted if large...
+MERGED_STRAIGHT_MAX = 0.85  # ...or least-straight finger chord/path, distorted if bent.
+MERGED_LOWEST = 0.85      # One hand: palm centre must be above the bottom 15% of the frame.
 
 
 @dataclass(frozen=True)
 class HandSeal:
-    """Which parts of the palms-together seal are present; every part must hold."""
+    """Result of the Naruto seal check, with the parts that are missing."""
 
     hands: int
     in_frame: bool = False
-    fingers_straight: bool = False
-    fingers_together: bool = False
     pointing_up: bool = False
     palms_together: bool = False
     measures: dict[str, float] = field(default_factory=dict, compare=False)
 
     @property
     def ok(self) -> bool:
-        return (self.hands >= 2 and self.in_frame and self.fingers_straight
-                and self.fingers_together and self.pointing_up and self.palms_together)
+        return self.hands >= 1 and self.in_frame and self.pointing_up and self.palms_together
 
     def describe(self) -> str:
-        if self.hands < 2:
-            return f"Hands seen: {self.hands} (need both)"
+        if self.hands == 0:
+            return "No hands in view"
         if not self.in_frame:
-            return "Hands seen: 2, but cut off by the frame edge"
+            return "Hands cut off by the frame edge"
         mark = {True: "yes", False: "no"}
-        return (f"Straight fingers: {mark[self.fingers_straight]}   "
-                f"together: {mark[self.fingers_together]}   "
-                f"pointing up: {mark[self.pointing_up]}   "
-                f"palms touching: {mark[self.palms_together]}")
+        return (f"Hands seen: {self.hands}   pointing up: {mark[self.pointing_up]}   "
+                f"palms pressed together: {mark[self.palms_together]}")
 
 
 def _hand_length(points: np.ndarray) -> float:
@@ -78,59 +77,50 @@ def _finger_gap(points: np.ndarray) -> float:
     return widest / max(_hand_length(points), 1e-6)
 
 
-def analyze_hand_seal(hands, width: int, height: int, world_hands=None) -> HandSeal:
-    """Check the Naruto seal: both palms pressed together, fingers straight, closed and up.
+def _tilt(points: np.ndarray) -> float:
+    direction = points[MIDDLE_KNUCKLE] - points[WRIST]
+    # Image y grows downwards, so "up" is negative y.
+    return math.degrees(math.atan2(abs(direction[0]), -direction[1]))
 
-    hands are image landmarks normalised to the frame; world_hands (metric 3D, optional)
-    give each hand's shape independent of how it is turned towards the camera.
-    """
-    if len(hands) < 2:
-        return HandSeal(hands=len(hands))
-    pair = [hand for hand in hands[:2] if len(hand) == 21]
-    if len(pair) != 2:
-        return HandSeal(hands=len(pair))
+
+def analyze_hand_seal(hands, width: int, height: int) -> HandSeal:
+    """Check the Naruto seal (palms pressed together, pointing up) in one frame."""
+    hands = [hand for hand in hands[:2] if len(hand) == 21]
+    if not hands:
+        return HandSeal(hands=0)
     # Hands cut off by the frame edge (e.g. resting on a knee below the camera) are guesses
     # by the landmarker, not a deliberate pose.
-    if any(not (0.0 <= p.x <= 1.0 and 0.0 <= p.y <= 1.0) for hand in pair for p in hand):
-        return HandSeal(hands=2)
-    image = [np.array([(p.x * width, p.y * height) for p in hand]) for hand in pair]
-    if not all(np.isfinite(points).all() for points in image):
-        return HandSeal(hands=2)
-    shapes = image
-    if world_hands is not None and len(world_hands) >= 2 and all(len(h) == 21 for h in world_hands[:2]):
-        shapes = [np.array([(p.x, p.y, p.z) for p in hand]) for hand in world_hands[:2]]
+    if any(not (0.0 <= p.x <= 1.0 and 0.0 <= p.y <= 1.0) for hand in hands for p in hand):
+        return HandSeal(hands=len(hands))
+    points = [np.array([(p.x * width, p.y * height) for p in hand]) for hand in hands]
+    if not all(np.isfinite(hand).all() for hand in points):
+        return HandSeal(hands=len(hands))
+    lengths = [max(_hand_length(hand), 1e-6) for hand in points]
+    tilt = max(_tilt(hand) for hand in points)
 
-    lengths = [_hand_length(points) for points in image]
-    if min(lengths) < 8.0 or max(lengths) > min(lengths) * SIZE_RATIO_MAX:
-        return HandSeal(hands=2, in_frame=True)
-    length = sum(lengths) / 2
+    if len(points) == 2:
+        palms = [hand[list(PALM)].mean(axis=0) for hand in points]
+        distance = float(np.linalg.norm(palms[0] - palms[1])) / (sum(lengths) / 2)
+        return HandSeal(hands=2, in_frame=True, pointing_up=tilt < TILT_MAX,
+                        palms_together=distance < PAIR_PALMS_MAX,
+                        measures={"tilt": tilt, "palms": distance})
 
-    def tilt(points: np.ndarray) -> float:
-        direction = points[MIDDLE_KNUCKLE] - points[WRIST]
-        # Image y grows downwards, so "up" is negative y.
-        return math.degrees(math.atan2(abs(direction[0]), -direction[1]))
-
-    palms = [points[list(PALM)].mean(axis=0) for points in image]
+    hand = points[0]
     measures = {
-        "straight": min(_straightness(points) for points in shapes),
-        "gap": max(_finger_gap(points) for points in shapes),
-        "tilt": max(tilt(points) for points in image),
-        "palms": float(np.linalg.norm(palms[0] - palms[1])) / length,
-        "tips": float(np.linalg.norm(image[0][12] - image[1][12])) / length,
+        "tilt": tilt,
+        "width": float(np.linalg.norm(hand[5] - hand[17])) / lengths[0],
+        "gap": _finger_gap(hand),
+        "straight": _straightness(hand),
+        "height": float(hand[list(PALM)].mean(axis=0)[1]) / height,
     }
-    return HandSeal(
-        hands=2,
-        in_frame=True,
-        fingers_straight=measures["straight"] >= STRAIGHT_MIN,
-        fingers_together=measures["gap"] < TOGETHER_MAX,
-        pointing_up=measures["tilt"] < UP_MAX_DEGREES,
-        palms_together=measures["palms"] < PALMS_MAX and measures["tips"] < TIPS_MAX,
-        measures=measures,
-    )
+    merged = (measures["width"] < MERGED_WIDTH_MAX and measures["height"] < MERGED_LOWEST
+              and (measures["gap"] > MERGED_GAP_MIN or measures["straight"] < MERGED_STRAIGHT_MAX))
+    return HandSeal(hands=1, in_frame=True, pointing_up=tilt < TILT_MAX,
+                    palms_together=merged, measures=measures)
 
 
-def joined_hands_from_landmarks(hands, width: int, height: int, world_hands=None) -> bool:
-    return analyze_hand_seal(hands, width, height, world_hands).ok
+def joined_hands_from_landmarks(hands, width: int, height: int) -> bool:
+    return analyze_hand_seal(hands, width, height).ok
 
 
 def substitution_anchor(mask: np.ndarray) -> tuple[int, int, int]:

@@ -38,76 +38,64 @@ class JoinedHandsTests(unittest.TestCase):
         self.assertFalse(joined_hands_from_landmarks(lowered, 640, 480))
 
     @staticmethod
-    def hand(center_x, *, spread=0.004, curl=False, top=0.47):
-        """One hand of a seal, seen edge-on: wrist low, straight closed fingers pointing up."""
-        points = [SimpleNamespace(x=center_x, y=0.75)]
-        offsets = (-1.5 * spread, -0.5 * spread, 0.5 * spread, 1.5 * spread)
-        points += [SimpleNamespace(x=center_x, y=0.70 - 0.02 * i) for i in range(4)]  # Thumb.
-        for offset in offsets:
-            tip_y = 0.62 if curl else top
-            for y in (0.60, 0.55, 0.51, tip_y):
-                points.append(SimpleNamespace(x=center_x + offset * (0.60 - y) / (0.60 - top), y=y))
+    def hand(center_x, knuckles=(-0.03, -0.01, 0.01, 0.03), tips=None, shift=0.0):
+        """21 landmarks of an upright hand; tips default to straight above the knuckles."""
+        tips = tips or knuckles
+        wrist_y, knuckle_y, tip_y = 0.80 + shift, 0.66 + shift, 0.50 + shift
+        points = [SimpleNamespace(x=center_x, y=wrist_y)]
+        points += [SimpleNamespace(x=center_x - 0.04, y=0.76 + shift - 0.03 * i) for i in range(4)]
+        for knuckle, tip in zip(knuckles, tips):
+            for step in range(4):
+                share = step / 3
+                points.append(SimpleNamespace(
+                    x=center_x + knuckle + (tip - knuckle) * share,
+                    y=knuckle_y + (tip_y - knuckle_y) * share))
         return points
 
-    def seal(self, **options):
-        return [self.hand(0.497, **options), self.hand(0.503, **options)]
+    NARROW = (-0.005, -0.002, 0.002, 0.005)
 
-    def test_palms_together_fingers_straight_closed_and_up_is_the_seal(self):
-        seal = analyze_hand_seal(self.seal(), 640, 480)
+    def merged(self, **options):
+        """Pressed palms seen as one hand: narrow side-on and distorted fingertips."""
+        return [self.hand(0.5, self.NARROW, tips=(-0.08, 0.0, 0.08, 0.0), **options)]
+
+    def test_two_hands_pressed_together_upright_is_the_seal(self):
+        seal = analyze_hand_seal([self.hand(0.49), self.hand(0.51)], 640, 480)
         self.assertTrue(seal.ok, seal)
-        self.assertTrue(joined_hands_from_landmarks(self.seal(), 640, 480))
+        self.assertEqual(seal.hands, 2)
 
-    def test_each_part_of_the_seal_is_required(self):
+    def test_merged_seal_is_recognized_from_one_distorted_narrow_hand(self):
+        seal = analyze_hand_seal(self.merged(), 640, 480)
+        self.assertTrue(seal.ok, seal)
+        self.assertEqual(seal.hands, 1)
+
+    def test_ordinary_single_hands_and_separated_hands_are_not_the_seal(self):
         cases = {
-            "fingers_together": self.seal(spread=0.06),
-            "fingers_straight": self.seal(curl=True),
-            "palms_together": [self.hand(0.35), self.hand(0.65)],
+            "hands apart": [self.hand(0.3), self.hand(0.7)],
+            "karate chop": [self.hand(0.5, self.NARROW)],
+            "open palm": [self.hand(0.5, (-0.05, -0.017, 0.017, 0.05))],
+            "merged but low": self.merged(shift=0.2),
         }
-        for failing, hands in cases.items():
-            with self.subTest(failing):
+        for name, hands in cases.items():
+            with self.subTest(name):
                 seal = analyze_hand_seal(hands, 640, 480)
                 self.assertFalse(seal.ok)
-                self.assertFalse(getattr(seal, failing))
-        sideways = [[SimpleNamespace(x=0.5 + (p.y - 0.6), y=0.6 + (p.x - 0.5)) for p in hand]
-                    for hand in self.seal()]
-        self.assertFalse(analyze_hand_seal(sideways, 640, 480).pointing_up)
-        self.assertEqual(analyze_hand_seal([self.hand(0.5)], 640, 480).hands, 1)
+                self.assertFalse(seal.palms_together)
 
-    def test_3d_hand_shape_overrides_an_edge_on_image(self):
-        splayed = [[SimpleNamespace(x=p.x, y=p.y, z=0.0) for p in self.hand(0.5, spread=0.06)]
-                   for _ in range(2)]
-        seal = analyze_hand_seal(self.seal(), 640, 480, world_hands=splayed)
-        self.assertFalse(seal.fingers_together)
+    def test_sideways_hands_are_not_pointing_up(self):
+        sideways = [[SimpleNamespace(x=0.5 + (p.y - 0.6) * 0.75, y=0.6 + (p.x - 0.5))
+                     for p in hand] for hand in (self.hand(0.49), self.hand(0.51))]
+        self.assertFalse(analyze_hand_seal(sideways, 640, 480).pointing_up)
 
     def test_feedback_names_what_is_missing(self):
-        text = analyze_hand_seal(self.seal(spread=0.06), 640, 480).describe()
-        self.assertIn("together: no", text)
-        self.assertIn("palms touching: yes", text)
-        self.assertIn("need both", analyze_hand_seal([self.hand(0.5)], 640, 480).describe())
+        text = analyze_hand_seal([self.hand(0.3), self.hand(0.7)], 640, 480).describe()
+        self.assertIn("palms pressed together: no", text)
+        self.assertIn("pointing up: yes", text)
+        self.assertEqual(analyze_hand_seal([], 640, 480).describe(), "No hands in view")
 
-    def test_rotated_views_map_back_to_the_real_frame(self):
-        height, width = 48, 64
-        row, column = 30, 50  # Inside both crops.
-        for rotation in range(4):
-            for crop in ((0.0, 0.0, 1.0, 1.0), (0.125, 0.25, 0.875, 1.0)):
-                with self.subTest(rotation=rotation, crop=crop):
-                    left, top, right, bottom = crop
-                    frame = np.zeros((height, width), np.uint8)
-                    frame[row, column] = 255
-                    region = frame[int(height * top):int(height * bottom),
-                                   int(width * left):int(width * right)]
-                    rotated = np.rot90(region, rotation)
-                    r, c = np.argwhere(rotated == 255)[0]
-                    point = SimpleNamespace(x=(c + 0.5) / rotated.shape[1],
-                                            y=(r + 0.5) / rotated.shape[0])
-                    mapped = app.view_to_frame([[point]], rotation, crop)[0][0]
-                    self.assertAlmostEqual(mapped.x, (column + 0.5) / width, places=6)
-                    self.assertAlmostEqual(mapped.y, (row + 0.5) / height, places=6)
-
-    def test_recognizer_uses_two_hands_in_the_current_frame(self):
+    def test_recognizer_checks_the_plain_frame_only(self):
         primary, alternate = Mock(), Mock()
         primary.detect_for_video.return_value = SimpleNamespace(
-            hand_landmarks=self.seal(), hand_world_landmarks=None)
+            hand_landmarks=[self.hand(0.49), self.hand(0.51)])
         recognizer = app.MultiViewHandLandmarker(primary, alternate)
         image = app.mp.Image(image_format=app.mp.ImageFormat.SRGB,
                              data=np.zeros((480, 640, 3), np.uint8))
@@ -115,23 +103,6 @@ class JoinedHandsTests(unittest.TestCase):
         self.assertEqual(recognizer.last_hand_count, 2)
         self.assertTrue(recognizer.last_seal.ok)
         alternate.detect.assert_not_called()
-
-    def test_hand_model_recovers_the_seal_in_a_rotated_view(self):
-        primary, alternate = Mock(), Mock()
-        primary.detect_for_video.return_value = SimpleNamespace(
-            hand_landmarks=[self.hand(0.497)], hand_world_landmarks=None)
-        # The second retry view is the full frame turned clockwise (np.rot90 k=3).
-        turned = [[SimpleNamespace(x=1 - p.y, y=p.x) for p in hand] for hand in self.seal()]
-        alternate.detect.side_effect = [
-            SimpleNamespace(hand_landmarks=[], hand_world_landmarks=None),
-            SimpleNamespace(hand_landmarks=turned, hand_world_landmarks=None),
-        ]
-        recognizer = app.MultiViewHandLandmarker(primary, alternate)
-        image = app.mp.Image(image_format=app.mp.ImageFormat.SRGB,
-                             data=np.zeros((480, 640, 3), np.uint8))
-        self.assertTrue(recognizer.recognize_joined_hands(image, 100))
-        self.assertEqual(recognizer.preferred_view, ("full", 3))
-        self.assertEqual(recognizer.last_hand_count, 2)
 
 
 class EffectTests(unittest.TestCase):

@@ -4,6 +4,33 @@ Vanish from your webcam with a hand gesture, live in Google Meet, Zoom or any ap
 uses a camera. Video is processed locally; nothing is recorded or uploaded. Runs on
 macOS, Linux and Windows from source: no installers or executables.
 
+![The six effects, rendered by VanishCam on a drawn scene](docs/demo.gif)
+
+<sub>Rendered by the app's own effect code on a drawn figure (`tools/make_demo_gif.py`),
+not a camera recording.</sub>
+
+## How it works
+
+1. VanishCam captures the empty room while you step out of frame for 4 seconds.
+2. You come back and make a gesture. MediaPipe tracks your hands, arms and silhouette
+   locally.
+3. The effect plays and the captured room shows where you were. In most effects the rest
+   of the room stays live.
+4. The result goes to a virtual camera, which Meet, Zoom or FaceTime pick like a webcam.
+
+## Effects
+
+Switch with the number keys while it runs.
+
+| Key | Effect | Gesture |
+| --- | --- | --- |
+| `1` | Normal | V sign (index and middle finger): dissolve |
+| `2` | Naruto | Hand seal for 0.3 s: palms pressed together, pointing up, fully in view (chest or face height). The preview says which part is missing |
+| `3` | Particles | V sign: you break into drifting particles |
+| `4` | Goku | Two joined fingers on the forehead for 0.3 s: teleport; repeat to return |
+| `5` | Itachi | Arms crossed over your chest for 0.3 s: flock of crows; cross again to return |
+| `6` | Snap | Snap your fingers: puff of smoke; snap again to return in another puff |
+
 Fork of [Nicovic17/vanish_webcam](https://github.com/Nicovic17/vanish_webcam):
 English UI, everything switchable live (effect, camera, background), preview-only overlay,
 direct virtual-camera output, and no EXE/licensing parts.
@@ -138,14 +165,7 @@ installed it disappears.
    **Live: …** when frames are flowing. On Windows run `vanishcam` instead of `./vanishcam`
    in the examples below.
 
-| Key | Effect | Gesture |
-| --- | --- | --- |
-| `1` | Normal | V sign (index and middle finger): dissolve |
-| `2` | Naruto | Hand seal for 0.3 s: palms pressed together, pointing up, fully in view (chest or face height). The preview says which part is missing |
-| `3` | Particles | V sign: you break into drifting particles |
-| `4` | Goku | Two joined fingers on the forehead for 0.3 s: teleport; repeat to return |
-| `5` | Itachi | Arms crossed over your chest for 0.3 s: flock of crows; cross again to return |
-| `6` | Snap | Snap your fingers: puff of smoke; snap again to return in another puff |
+The gestures for each effect are listed under [Effects](#effects).
 
 While vanished (Normal, Particles, Goku, Snap) the room stays live and only your silhouette is
 replaced by the captured background, matched to the camera's current exposure.
@@ -228,9 +248,12 @@ orientation (the preview is mirrored, like a mirror).
 ./vanishcam --self-test   # checks models, assets and audio without opening a camera
 ```
 
+Regenerate `docs/demo.gif` after changing an effect:
+`.venv/bin/python tools/make_demo_gif.py`.
+
 Layout: `bootstrap.py` (venv setup), `vanish_cam.py` (app, overlay, camera switching), `*_effect.py` (effects),
 `vanish_sound.py`, `mediapipe_log_filter.py` (quiets MediaPipe logs), `backgrounds/`, `models/`,
-`assets/`, `tests/`.
+`assets/`, `tests/`, `tools/` (demo GIF).
 
 ## Credits
 

@@ -1,6 +1,6 @@
-"""Render docs/demo.gif: every effect played by the app's own renderers on a drawn scene.
+"""Render docs/demo.gif: every effect played by the app's own renderers.
 
-No camera is used; the person is a simple drawn figure. Run from the repo root:
+No camera is used: a glowing line figure does each gesture on a black stage. Run from the repo root:
     .venv/bin/python tools/make_demo_gif.py
 """
 
@@ -32,50 +32,99 @@ CAPTION = 30
 OUTPUT = ROOT / "docs" / "demo.gif"
 
 
-def room() -> np.ndarray:
-    """A plain home-office wall: window, shelf, plant, desk edge (BGR)."""
-    image = np.empty((HEIGHT, WIDTH, 3), np.uint8)
-    shade = np.linspace(0, 1, HEIGHT)[:, None]
-    image[:] = (np.array([178, 196, 214]) * (1 - 0.15 * shade))[:, :, None].transpose(0, 2, 1)
-    cv2.rectangle(image, (24, 34), (140, 150), (120, 92, 70), -1)
-    cv2.rectangle(image, (30, 40), (134, 144), (235, 214, 170), -1)
-    cv2.line(image, (82, 40), (82, 144), (120, 92, 70), 4)
-    cv2.line(image, (30, 92), (134, 92), (120, 92, 70), 4)
-    cv2.rectangle(image, (345, 70), (455, 78), (70, 98, 130), -1)
-    for x, height, color in ((352, 30, (60, 60, 170)), (366, 26, (150, 110, 50)),
-                             (378, 32, (70, 140, 90)), (392, 22, (40, 150, 200))):
-        cv2.rectangle(image, (x, 70 - height), (x + 11, 70), color, -1)
-    cv2.rectangle(image, (420, 52), (444, 70), (90, 120, 170), -1)
-    cv2.ellipse(image, (432, 52), (18, 12), 0, 180, 360, (70, 150, 80), -1)
-    cv2.rectangle(image, (0, 228), (WIDTH, HEIGHT), (80, 108, 140), -1)
-    cv2.rectangle(image, (0, 228), (WIDTH, 233), (60, 84, 112), -1)
-    return cv2.GaussianBlur(image, (3, 3), 0)
+def backdrop() -> np.ndarray:
+    """Black stage with a faint perspective grid (BGR)."""
+    image = np.zeros((HEIGHT, WIDTH, 3), np.uint8)
+    horizon, cx = 150, WIDTH // 2
+    for x in range(-WIDTH, 2 * WIDTH, 48):
+        cv2.line(image, (cx + (x - cx) // 6, horizon), (x, HEIGHT), (70, 30, 60), 1, cv2.LINE_AA)
+    for step in range(9):
+        y = horizon + int((HEIGHT - horizon) * (step / 8) ** 1.8)
+        cv2.line(image, (0, y), (WIDTH, y), (70, 30, 60), 1, cv2.LINE_AA)
+    for x, y in ((40, 30), (110, 70), (390, 40), (450, 100), (300, 20), (180, 110), (70, 120)):
+        cv2.circle(image, (x, y), 1, (150, 150, 150), -1)
+    return image
 
 
-def person(background: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    """A drawn person at a desk: the frame with them in it, and their mask."""
-    mask = np.zeros((HEIGHT, WIDTH), np.uint8)
-    frame = background.copy()
+# Joint offsets from the figure's centre line, in pixels at 270 px frame height.
+# The figure faces the camera; "left"/"right" are screen sides.
+IDLE = dict(l_elbow=(-30, 118), l_hand=(-38, 158), r_elbow=(30, 118), r_hand=(38, 158))
+POSES = {
+    "idle": IDLE,
+    "v_sign": dict(IDLE, r_elbow=(44, 86), r_hand=(52, 46)),
+    "palms": dict(l_elbow=(-34, 122), l_hand=(-5, 102), r_elbow=(34, 122), r_hand=(9, 102)),
+    "forehead": dict(IDLE, r_elbow=(48, 90), r_hand=(31, 43)),
+    "crossed": dict(l_elbow=(-32, 132), l_hand=(22, 86), r_elbow=(32, 132), r_hand=(-22, 86)),
+    "snap": dict(IDLE, r_elbow=(48, 100), r_hand=(46, 62)),
+}
+HEAD, HIP = (0, 48), (0, 160)
+LEGS = (((-16, 206), (-26, 252)), ((16, 206), (26, 252)))
+
+
+def blend(pose_a: str, pose_b: str, amount: float) -> dict[str, tuple[float, float]]:
+    amount = 0.5 - 0.5 * np.cos(np.pi * float(np.clip(amount, 0, 1)))
+    a, b = POSES[pose_a], POSES[pose_b]
+    return {k: (a[k][0] + (b[k][0] - a[k][0]) * amount, a[k][1] + (b[k][1] - a[k][1]) * amount)
+            for k in a}
+
+
+def figure(background: np.ndarray, joints: dict, color: tuple[int, int, int],
+           detail: str = "") -> tuple[np.ndarray, np.ndarray]:
+    """A glowing line figure over the backdrop, and its mask."""
     cx = WIDTH // 2
-    body = np.array([[cx - 88, 228], [cx - 74, 150], [cx - 40, 128], [cx + 40, 128],
-                     [cx + 74, 150], [cx + 88, 228]], np.int32)
-    shirt = (150, 96, 52)
-    cv2.fillPoly(frame, [body], shirt)
-    cv2.fillPoly(mask, [body], 1)
-    cv2.rectangle(frame, (cx - 13, 108), (cx + 13, 132), (120, 160, 215), -1)
-    cv2.rectangle(mask, (cx - 13, 108), (cx + 13, 132), 1, -1)
-    cv2.ellipse(frame, (cx, 128), (24, 10), 0, 0, 180, (120, 160, 215), -1)
-    cv2.ellipse(frame, (cx, 84), (34, 40), 0, 0, 360, (140, 180, 230), -1)
-    cv2.ellipse(mask, (cx, 84), (34, 40), 0, 0, 360, 1, -1)
-    cv2.ellipse(frame, (cx, 70), (37, 30), 0, 180, 360, (40, 52, 70), -1)
-    cv2.ellipse(mask, (cx, 70), (37, 30), 0, 180, 360, 1, -1)
-    for dx in (-13, 13):
-        cv2.circle(frame, (cx + dx, 88), 3, (50, 40, 40), -1)
-    cv2.ellipse(frame, (cx, 102), (10, 5), 0, 10, 170, (70, 80, 150), 2)
-    cv2.line(frame, (cx, 140), (cx, 228), (120, 76, 40), 2)
-    soft = cv2.GaussianBlur(mask.astype(np.float32), (5, 5), 0)
-    frame = (frame * soft[:, :, None] + background * (1 - soft[:, :, None])).astype(np.uint8)
-    return frame, soft
+    lines = np.zeros((HEIGHT, WIDTH), np.uint8)
+
+    def pt(offset):
+        return int(cx + offset[0]), int(offset[1])
+
+    cv2.circle(lines, pt(HEAD), 21, 255, 5, cv2.LINE_AA)
+    cv2.line(lines, pt((0, 69)), pt(HIP), 255, 5, cv2.LINE_AA)
+    for knee, foot in LEGS:
+        cv2.polylines(lines, [np.array([pt(HIP), pt(knee), pt(foot)])], False, 255, 5, cv2.LINE_AA)
+    cv2.line(lines, pt((-8, 84)), pt((8, 84)), 255, 5, cv2.LINE_AA)
+    for side, shoulder in (("l", -8), ("r", 8)):
+        arm = np.array([pt((shoulder, 84)), pt(joints[f"{side}_elbow"]),
+                        pt(joints[f"{side}_hand"])])
+        cv2.polylines(lines, [arm], False, 255, 5, cv2.LINE_AA)
+    hand = np.array(pt(joints["r_hand"]))
+    if detail == "v":
+        for dx in (-9, 9):
+            cv2.line(lines, tuple(hand), tuple(hand + (dx, -18)), 255, 4, cv2.LINE_AA)
+    elif detail == "forehead":
+        for dy in (-11, -4):
+            cv2.line(lines, tuple(hand), tuple(hand + (-17, dy)), 255, 2, cv2.LINE_AA)
+    elif detail == "palms":
+        for side, dx in (("l", 7), ("r", -7)):
+            wrist = np.array(pt(joints[f"{side}_hand"]))
+            cv2.line(lines, tuple(wrist), tuple(wrist + (dx, -19)), 255, 3, cv2.LINE_AA)
+    elif detail == "snap":
+        for offset in ((-6, -7), (2, -10)):
+            cv2.line(lines, tuple(hand), tuple(hand + offset), 255, 3, cv2.LINE_AA)
+    mask = cv2.GaussianBlur(cv2.dilate(lines, np.ones((7, 7), np.uint8)), (7, 7), 0)
+    mask = mask.astype(np.float32) / 255
+    glow = cv2.GaussianBlur(lines, (0, 0), 6).astype(np.float32) / 255
+    core = lines.astype(np.float32) / 255
+    tint = np.array(color, np.float32)
+    frame = background.astype(np.float32)
+    frame += glow[:, :, None] * tint * 1.4
+    frame = frame * (1 - core[:, :, None]) + core[:, :, None] * (tint * 0.55 + 255 * 0.45)
+    frame = np.clip(frame, 0, 255).astype(np.uint8)
+    return frame, mask
+
+
+def snap_flash(scene: np.ndarray) -> list[np.ndarray]:
+    center = np.array(POSES["snap"]["r_hand"]) + (WIDTH // 2 + 10, -12)
+    frames = []
+    for spark in (0.25, 0.65, 1):
+        frame = scene.copy()
+        for angle in np.linspace(0, 2 * np.pi, 8, endpoint=False):
+            direction = np.array([np.cos(angle), np.sin(angle)])
+            start = center + direction * (3 + 6 * spark)
+            end = center + direction * (7 + 13 * spark)
+            cv2.line(frame, tuple(start.astype(int)), tuple(end.astype(int)),
+                     (80, 255, 255), 2, cv2.LINE_AA)
+        frames.append(frame)
+    return frames
 
 
 def timeline(seconds: float) -> np.ndarray:
@@ -102,54 +151,77 @@ def captioned(frames: list[np.ndarray], key: str, name: str, gesture: str) -> li
     return out
 
 
+def gesture(background, pose: str, color, detail: str = "") -> list[np.ndarray]:
+    """Idle, then the figure moves into the gesture and holds it."""
+    clip = [figure(background, POSES["idle"], color)[0]] * round(0.3 * FPS)
+    clip += [figure(background, blend("idle", pose, t / 0.45), color,
+                    detail if t >= 0.45 else "")[0] for t in timeline(0.45)]
+    return clip + [figure(background, POSES[pose], color, detail)[0]] * round(0.35 * FPS)
+
+
+def relax(background, pose: str, color, detail: str = "") -> list[np.ndarray]:
+    clip = [figure(background, POSES[pose], color, detail)[0]] * round(0.25 * FPS)
+    return clip + [figure(background, blend(pose, "idle", t / 0.45), color)[0]
+                   for t in timeline(0.45)] + [figure(background, POSES["idle"], color)[0]] * 4
+
+
 def main() -> None:
-    background = room()
-    frame, mask = person(background)
+    background = backdrop()
     clips = []
 
+    cyan, magenta, lime, gold, red, pink = ((255, 230, 40), (255, 60, 230), (60, 255, 120),
+                                            (40, 210, 255), (70, 70, 255), (190, 110, 255))
+
+    frame, mask = figure(background, POSES["v_sign"], cyan, "v")
     field, noise = app.make_dissolve_fields(HEIGHT, WIDTH)
-    clip = hold(frame, 0.5) + [
-        app.apply_dissolve(frame, background, mask, min(1.0, t / 2.0), field, noise)
-        for t in timeline(2.0)] + hold(background, 0.5)
+    clip = gesture(background, "v_sign", cyan, "v") + [
+        app.apply_dissolve(frame, background, mask, min(1.0, t / 1.6), field, noise)
+        for t in timeline(1.6)] + hold(background, 0.4)
     clips.append(captioned(clip, "1", "Normal", "V sign: dissolve"))
 
+    frame, mask = figure(background, POSES["palms"], gold, "palms")
     sprite, cache = load_log(), {}
     anchor = substitution_anchor(mask)
     landed = background.copy()
     overlay_log(landed, sprite, landed_log_anchor(anchor, HEIGHT), cache=cache)
-    clip = hold(frame, 0.5) + [
+    clip = gesture(background, "palms", gold, "palms") + [
         render_substitution(frame, background, mask, sprite, anchor, max(0.04, t), cache)
         for t in timeline(NARUTO_SECONDS)] + hold(landed, 0.6)
     clips.append(captioned(clip, "2", "Naruto", "palms together: smoke, a log stays behind"))
 
+    frame, mask = figure(background, POSES["v_sign"], magenta, "v")
     particles = ParticleEffect(frame, mask, seed=5)
-    clip = hold(frame, 0.5) + [particles.render(background, t)
-                               for t in timeline(PARTICLE_SECONDS)] + hold(background, 0.4)
+    clip = gesture(background, "v_sign", magenta, "v") + [
+        particles.render(background, t) for t in timeline(PARTICLE_SECONDS)] + hold(background, 0.3)
     clips.append(captioned(clip, "3", "Particles", "V sign: blown away in the wind"))
 
+    frame, mask = figure(background, POSES["forehead"], lime, "forehead")
     teleport_out = GokuTeleport(frame, background, mask)
     teleport_in = GokuTeleport(frame, background, mask)
     slow = 3  # The teleport lasts 0.25 s; play it slower so it reads in a GIF.
-    clip = (hold(frame, 0.5)
+    clip = (gesture(background, "forehead", lime, "forehead")
             + [teleport_out.render(background, t / slow, False) for t in timeline(TELEPORT_SECONDS * slow)]
-            + hold(background, 0.6)
+            + hold(background, 0.5)
             + [teleport_in.render(background, t / slow, True) for t in timeline(TELEPORT_SECONDS * slow)]
-            + hold(frame, 0.4))
+            + relax(background, "forehead", lime, "forehead"))
     clips.append(captioned(clip, "4", "Goku", "two fingers on forehead: teleport out and back"))
 
+    frame, mask = figure(background, POSES["crossed"], red)
     crows = ItachiCrowEffect(frame, mask)
     speed = 1.6  # Shorten the 4 s scatter for the GIF.
-    clip = hold(frame, 0.4) + [crows.render(background, t * speed, False)
-                               for t in timeline(ITACHI_SECONDS / speed)] + hold(background, 0.4)
+    clip = gesture(background, "crossed", red) + [
+        crows.render(background, t * speed, False)
+        for t in timeline(ITACHI_SECONDS / speed)] + hold(background, 0.3)
     clips.append(captioned(clip, "5", "Itachi", "arms crossed: scatter into crows"))
 
-    cover = app.widen_mask(mask)
+    frame, mask = figure(background, POSES["snap"], pink, "snap")
+    cover = app.widen_mask(cv2.dilate(mask, np.ones((15, 15), np.uint8)))
     puff = snap_anchor(cover)
-    clip = (hold(frame, 0.4)
+    clip = (gesture(background, "snap", pink, "snap") + snap_flash(frame)
             + [render_snap(frame, background, cover, puff, t, False) for t in timeline(SNAP_SECONDS)]
-            + hold(background, 0.5)
+            + hold(background, 0.3) + snap_flash(background)
             + [render_snap(frame, background, cover, puff, t, True) for t in timeline(SNAP_SECONDS)]
-            + hold(frame, 0.5))
+            + relax(background, "snap", pink, "snap"))
     clips.append(captioned(clip, "6", "Snap", "finger snap: gone in smoke, snap again: back"))
 
     frames = [Image.fromarray(cv2.cvtColor(f, cv2.COLOR_BGR2RGB)) for clip in clips for f in clip]
@@ -160,7 +232,9 @@ def main() -> None:
     palette = sheet.quantize(colors=255, method=Image.Quantize.MEDIANCUT)
     frames = [f.quantize(palette=palette, dither=Image.Dither.NONE) for f in frames]
     OUTPUT.parent.mkdir(exist_ok=True)
-    frames[0].save(OUTPUT, save_all=True, append_images=frames[1:], duration=round(1000 / FPS),
+    # GIF delays are whole centiseconds; round cumulative times to avoid drift.
+    ticks = [round(i * 100 / FPS) for i in range(len(frames) + 1)]
+    frames[0].save(OUTPUT, save_all=True, append_images=frames[1:], duration=list(10 * np.diff(ticks)),
                    loop=0, optimize=True, disposal=1)
     print(f"{OUTPUT.relative_to(ROOT)}: {len(frames)} frames, "
           f"{len(frames) / FPS:.1f} s, {OUTPUT.stat().st_size / 1e6:.1f} MB")

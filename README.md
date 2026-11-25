@@ -6,8 +6,7 @@ macOS, Linux and Windows from source: no installers or executables.
 
 ![The six effects, rendered by VanishCam on a drawn scene](docs/demo.gif)
 
-<sub>Rendered by the app's own effect code on a drawn figure (`tools/make_demo_gif.py`),
-not a camera recording.</sub>
+<sub>VanishCam’s effects animate a neon line figure on a black stage (`tools/make_demo_gif.py`).</sub>
 
 ## How it works
 

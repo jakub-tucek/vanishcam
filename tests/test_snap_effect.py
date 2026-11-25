@@ -6,7 +6,7 @@ import numpy as np
 
 from snap_effect import SNAP_SECONDS, SnapDetector, SnapRecognizer, render_snap, snap_anchor
 import vanish_cam as app
-from tests.test_video_output import LoopControlTests
+from tests import test_video_output
 
 
 def hand(pinched: bool):
@@ -87,7 +87,7 @@ class SnapRenderTests(unittest.TestCase):
 
 
 class SnapLoopTests(unittest.TestCase):
-    run_loop = LoopControlTests.run_loop
+    run_loop = test_video_output.LoopControlTests.run_loop
 
     def test_snaps_vanish_and_bring_back_with_smoke(self):
         recognizer = Mock()

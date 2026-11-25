@@ -17,6 +17,9 @@ Runs locally on macOS, Linux and Windows. Nothing is recorded or uploaded.
 | `6` | Snap | Finger snap: puff of smoke (snap again to return) |
 | `7` | Clones | Index and middle fingers of both hands crossed (+): live shadow clones (repeat to dismiss) |
 
+Turn on as many as you like with the number keys: each listens for its own gesture and the
+first one you do plays. Normal and Particles share the V sign, so only one of them can be on.
+
 ## Install
 
 Needs Python 3.11–3.13 and a virtual camera driver (below).
@@ -74,7 +77,7 @@ Enable **Settings → Privacy & security → Camera → Let desktop apps access 
 
 | Key | Action |
 | --- | --- |
-| `1`–`7` | Switch effect |
+| `1`–`7` | Turn an effect on/off |
 | `V` / `R` | Vanish / reappear manually |
 | `G` | Gestures on/off |
 | `B` | Background: off → blur → images in `backgrounds/` |
@@ -84,7 +87,7 @@ Enable **Settings → Privacy & security → Camera → Let desktop apps access 
 | `F` / `H` / `Q` | Fullscreen / hide buttons / quit |
 
 Your effect, camera, background and mute choices are remembered. Run
-`./vanishcam --help` for all options (`--mode`, `--camera`, `--background`,
+`./vanishcam --help` for all options (`--effects snap,clones`, `--camera`, `--background`,
 `--gesture-debug`, …).
 
 ## Troubleshooting

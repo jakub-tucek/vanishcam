@@ -233,7 +233,8 @@ class VideoOutputsTests(unittest.TestCase):
 class LoopControlTests(unittest.TestCase):
     """Drive run_camera frame by frame: each frame read advances the fake clock."""
 
-    def run_loop(self, mode, times, keys, recognizer=None, person_mask=None, extra=(), **options):
+    def run_loop(self, mode, times, keys, recognizer=None, person_mask=None, extra=(), effects=None,
+                 recognizers=None, **options):
         clock = [0.0]
         frames = iter(times)
 
@@ -250,7 +251,9 @@ class LoopControlTests(unittest.TestCase):
             mocks.enter_context(patch.object(app, "download_models"))
             mocks.enter_context(patch.object(app, "save_settings"))
             mocks.enter_context(patch.object(app, "open_camera", return_value=capture))
-            tasks = mocks.enter_context(patch.object(app, "create_tasks", return_value=(Mock(), recognizer)))
+            tasks = mocks.enter_context(patch.object(
+                app, "create_tasks",
+                side_effect=lambda name: (Mock(), (recognizers or {}).get(name, recognizer))))
             mocks.enter_context(patch.object(app, "open_virtual_camera", return_value=None))
             mocks.enter_context(patch.object(app, "VanishSound"))
             mocks.enter_context(patch.object(app, "person_mask", side_effect=person_mask or (lambda *a: mask)))
@@ -264,7 +267,8 @@ class LoopControlTests(unittest.TestCase):
                 mocks.enter_context(target)
             printed = mocks.enter_context(patch("builtins.print"))
             with ExitStack() as resources:
-                self.assertEqual(app.run_camera(arguments(mode=mode, **options), resources, mode), 0)
+                self.assertEqual(app.run_camera(arguments(mode=mode, **options), resources, mode,
+                                                effects), 0)
         messages = [c.args[0] for c in printed.call_args_list if c.args]
         return tasks, messages
 
@@ -284,13 +288,41 @@ class LoopControlTests(unittest.TestCase):
         self.assertGreaterEqual(len(stamps), 5)
         self.assertEqual(stamps, sorted(set(stamps)))
 
-    def test_number_keys_switch_effect_and_load_its_models(self):
+    def test_number_keys_toggle_effects_and_load_their_models(self):
         recognizer = Mock()
         recognizer.recognize_joined_hands.return_value = False
-        tasks, messages = self.run_loop(
-            "normal", (0.1, 4.1, 4.3, 4.5, 4.7), (0, 0, ord("2"), 0, ord("q")), recognizer=recognizer)
-        self.assertEqual([c.args[0] for c in tasks.call_args_list], ["normal", "naruto"])
-        self.assertIn("[Webcam] Effect: Naruto", messages)
+        saved = Mock()
+        times = (0.1, 4.1, 4.3, 4.5, 4.7, 4.9, 5.1)
+        keys = (0, 0, ord("2"), ord("1"), ord("2"), ord("3"), ord("q"))
+        tasks, messages = self.run_loop("normal", times, keys, recognizer=recognizer,
+                                        extra=(patch.object(app, "save_settings", saved),))
+        self.assertEqual([c.args[0] for c in tasks.call_args_list], ["normal", "naruto", "particles"])
+        self.assertEqual([m for m in messages if m.startswith("[Webcam] ") and "Effects:" in m
+                          or "stays on" in m], [
+            "[Webcam] Naruto on. Effects: Normal, Naruto",
+            "[Webcam] Normal off. Effects: Naruto",
+            "[Webcam] Naruto is the only effect on; it stays on.",
+            "[Webcam] Particles on. Effects: Naruto, Particles",
+        ])
+        self.assertEqual(saved.call_args.kwargs["effects"], ["naruto", "particles"])
+
+    def test_enabled_effects_all_watch_and_the_first_gesture_wins(self):
+        snap, clones = Mock(), Mock()
+        snap.recognize_snap.return_value = False
+        snap.describe.return_value = ""
+        answers = iter([True, True, True])
+        clones.recognize_seal.side_effect = lambda image, ts: next(answers, False)
+        times = (0.1, 4.1, 4.2, 4.4, 4.55, 4.6, 4.7)
+        _, messages = self.run_loop("snap", times, (0,) * 6 + (ord("q"),), effects=["snap", "clones"],
+                                    recognizers={"snap": snap, "clones": clones})
+        self.assertIn("[Clones] Summoned.", messages)
+        # Snap watched every ready frame; once the clones are out only Clones listens.
+        self.assertEqual(snap.recognize_snap.call_count, 3)
+
+    def test_v_sign_effects_exclude_each_other(self):
+        self.assertEqual(app.normalize_effects(["particles", "snap", "normal", "bogus"]),
+                         ["particles", "snap"])
+        self.assertEqual(app.normalize_effects([]), ["normal"])
 
     def test_g_pauses_gesture_recognition_until_pressed_again(self):
         recognize = Mock(return_value=("Victory", 0.95))

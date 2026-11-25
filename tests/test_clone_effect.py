@@ -6,7 +6,7 @@ import numpy as np
 
 from clone_effect import CLONE_SECONDS, CloneSealRecognizer, CloneSquad, analyze_clone_seal
 import vanish_cam as app
-from tests.test_video_output import LoopControlTests
+from tests import test_video_output
 
 
 def hand(wrist, direction, folded=True, length=0.1):
@@ -91,7 +91,7 @@ class CloneRenderTests(unittest.TestCase):
 
 
 class CloneLoopTests(unittest.TestCase):
-    run_loop = LoopControlTests.run_loop
+    run_loop = test_video_output.LoopControlTests.run_loop
 
     def test_seal_summons_and_dismisses(self):
         answers = iter([True, True, True, False, False, True, True, True])

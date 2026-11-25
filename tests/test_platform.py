@@ -59,3 +59,26 @@ class InstanceLockTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class EffectSelectionTests(unittest.TestCase):
+    def started_with(self, settings, **flags):
+        import argparse
+        from unittest.mock import patch
+        values = dict(mode=None, effects=None, camera=0, background="off", mute=False, self_test=False)
+        values.update(flags)
+        with patch.object(app, "parse_args", return_value=argparse.Namespace(**values)), \
+                patch.object(app, "load_settings", return_value=settings), \
+                patch.object(app, "run_camera", return_value=0) as run_camera:
+            app.run()
+        _, _, mode, effects = run_camera.call_args.args
+        return mode, effects
+
+    def test_effects_flag_mode_flag_and_remembered_set(self):
+        self.assertEqual(self.started_with({}, effects="Clones, snap,normal,particles"),
+                         ("normal", ["normal", "snap", "clones"]))
+        self.assertEqual(self.started_with({"effects": ["snap", "clones"]}, mode="goku"),
+                         ("goku", ["goku"]))
+        self.assertEqual(self.started_with({"effects": ["snap", "clones"], "mode": "clones"}),
+                         ("clones", ["snap", "clones"]))
+        self.assertEqual(self.started_with({"mode": "itachi"}), ("itachi", ["itachi"]))

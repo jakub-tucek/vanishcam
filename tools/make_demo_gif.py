@@ -24,6 +24,7 @@ from naruto_effect import (  # noqa: E402
     render_substitution, substitution_anchor,
 )
 from particles_effect import PARTICLE_SECONDS, ParticleEffect  # noqa: E402
+from clone_effect import CLONE_SECONDS, CloneSquad  # noqa: E402
 from snap_effect import SNAP_SECONDS, render_snap, snap_anchor  # noqa: E402
 
 WIDTH, HEIGHT = 480, 270
@@ -56,6 +57,7 @@ POSES = {
     "forehead": dict(IDLE, r_elbow=(48, 90), r_hand=(31, 43)),
     "crossed": dict(l_elbow=(-32, 132), l_hand=(22, 86), r_elbow=(32, 132), r_hand=(-22, 86)),
     "snap": dict(IDLE, r_elbow=(48, 100), r_hand=(46, 62)),
+    "seal": dict(l_elbow=(-36, 118), l_hand=(-14, 104), r_elbow=(36, 124), r_hand=(4, 116)),
 }
 HEAD, HIP = (0, 48), (0, 160)
 LEGS = (((-16, 206), (-26, 252)), ((16, 206), (26, 252)))
@@ -97,6 +99,10 @@ def figure(background: np.ndarray, joints: dict, color: tuple[int, int, int],
         for side, dx in (("l", 7), ("r", -7)):
             wrist = np.array(pt(joints[f"{side}_hand"]))
             cv2.line(lines, tuple(wrist), tuple(wrist + (dx, -19)), 255, 3, cv2.LINE_AA)
+    elif detail == "seal":
+        left, right = np.array(pt(joints["l_hand"])), np.array(pt(joints["r_hand"]))
+        cv2.line(lines, tuple(left), tuple(left + (26, 0)), 255, 3, cv2.LINE_AA)
+        cv2.line(lines, tuple(right), tuple(right + (0, -24)), 255, 3, cv2.LINE_AA)
     elif detail == "snap":
         for offset in ((-6, -7), (2, -10)):
             cv2.line(lines, tuple(hand), tuple(hand + offset), 255, 3, cv2.LINE_AA)
@@ -223,6 +229,20 @@ def main() -> None:
             + [render_snap(frame, background, cover, puff, t, True) for t in timeline(SNAP_SECONDS)]
             + relax(background, "snap", pink, "snap"))
     clips.append(captioned(clip, "6", "Snap", "finger snap: gone in smoke, snap again: back"))
+
+    orange = (40, 140, 255)
+    frame, mask = figure(background, POSES["seal"], orange, "seal")
+    squad = CloneSquad(mask)
+    clip = gesture(background, "seal", orange, "seal")
+    clip += [squad.render(frame, mask, t, "appearing") for t in timeline(CLONE_SECONDS)]
+    for t in timeline(1.6):  # The clones copy the live figure: wave, and they all wave.
+        pose = blend("seal", "v_sign", 1 - abs(1 - t / 0.8))
+        live, live_mask = figure(background, pose, orange)
+        clip.append(squad.render(live, live_mask))
+    clip += [squad.render(frame, mask) for _ in range(round(0.4 * FPS))]
+    clip += [squad.render(frame, mask, t, "leaving") for t in timeline(CLONE_SECONDS)]
+    clip += relax(background, "seal", orange, "seal")
+    clips.append(captioned(clip, "7", "Clones", "crossed fingers: live shadow clones, again to dismiss"))
 
     frames = [Image.fromarray(cv2.cvtColor(f, cv2.COLOR_BGR2RGB)) for clip in clips for f in clip]
     samples = frames[::max(1, len(frames) // 24)]

@@ -15,6 +15,7 @@ Runs locally on macOS, Linux and Windows. Nothing is recorded or uploaded.
 | `4` | Goku | Two fingers on the forehead: teleport (repeat to return) |
 | `5` | Itachi | Arms crossed over the chest: flock of crows (repeat to return) |
 | `6` | Snap | Finger snap: puff of smoke (snap again to return) |
+| `7` | Clones | Index and middle fingers of both hands crossed (+): live shadow clones (repeat to dismiss) |
 
 ## Install
 
@@ -73,7 +74,7 @@ Enable **Settings → Privacy & security → Camera → Let desktop apps access 
 
 | Key | Action |
 | --- | --- |
-| `1`–`6` | Switch effect |
+| `1`–`7` | Switch effect |
 | `V` / `R` | Vanish / reappear manually |
 | `G` | Gestures on/off |
 | `B` | Background: off → blur → images in `backgrounds/` |

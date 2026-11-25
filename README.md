@@ -21,8 +21,8 @@ macOS:
 
 ```sh
 brew install python@3.12
-git clone https://github.com/jakub-tucek/vanishcam-mac.git
-cd vanishcam-mac
+git clone https://github.com/jakub-tucek/vanishcam.git
+cd vanishcam
 ./vanishcam
 ```
 
@@ -30,8 +30,8 @@ Linux (Debian/Ubuntu; use your distribution's packages elsewhere):
 
 ```sh
 sudo apt install python3 python3-venv git libgl1
-git clone https://github.com/jakub-tucek/vanishcam-mac.git
-cd vanishcam-mac
+git clone https://github.com/jakub-tucek/vanishcam.git
+cd vanishcam
 ./vanishcam
 ```
 
@@ -39,8 +39,8 @@ Windows: install Python 3.12 from [python.org](https://www.python.org/downloads/
 (keep the *py launcher* option on), then in PowerShell or Command Prompt:
 
 ```bat
-git clone https://github.com/jakub-tucek/vanishcam-mac.git
-cd vanishcam-mac
+git clone https://github.com/jakub-tucek/vanishcam.git
+cd vanishcam
 vanishcam
 ```
 

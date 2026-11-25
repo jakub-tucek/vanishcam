@@ -97,7 +97,11 @@ class CloneSealRecognizer:
 
     def recognize_seal(self, image: mp.Image, timestamp_ms: int) -> bool:
         hands = self.landmarker.detect_for_video(image, timestamp_ms).hand_landmarks
-        self.last_seal = analyze_clone_seal(hands, image.width, image.height)
+        return self.observe(hands, image.width, image.height)
+
+    def observe(self, hands, width: int, height: int) -> bool:
+        """Check hand landmarks someone else already detected on this frame."""
+        self.last_seal = analyze_clone_seal(hands, width, height)
         return self.last_seal.ok
 
     def close(self) -> None:

@@ -306,18 +306,23 @@ class LoopControlTests(unittest.TestCase):
         ])
         self.assertEqual(saved.call_args.kwargs["effects"], ["naruto", "particles"])
 
-    def test_enabled_effects_all_watch_and_the_first_gesture_wins(self):
+    def test_enabled_effects_share_one_hand_pass_and_the_first_gesture_wins(self):
         snap, clones = Mock(), Mock()
-        snap.recognize_snap.return_value = False
+        snap.observe.return_value = False
         snap.describe.return_value = ""
+        snap.landmarker.detect_for_video.return_value = SimpleNamespace(hand_landmarks=[])
         answers = iter([True, True, True])
-        clones.recognize_seal.side_effect = lambda image, ts: next(answers, False)
+        clones.observe.side_effect = lambda hands, width, height: next(answers, False)
         times = (0.1, 4.1, 4.2, 4.4, 4.55, 4.6, 4.7)
         _, messages = self.run_loop("snap", times, (0,) * 6 + (ord("q"),), effects=["snap", "clones"],
                                     recognizers={"snap": snap, "clones": clones})
         self.assertIn("[Clones] Summoned.", messages)
-        # Snap watched every ready frame; once the clones are out only Clones listens.
-        self.assertEqual(snap.recognize_snap.call_count, 3)
+        # One landmarker pass per ready frame feeds both; once the clones are out only
+        # Clones listens.
+        self.assertEqual(snap.landmarker.detect_for_video.call_count, 3)
+        self.assertEqual(snap.observe.call_count, 3)
+        snap.recognize_snap.assert_not_called()
+        clones.recognize_seal.assert_not_called()
 
     def test_v_sign_effects_exclude_each_other(self):
         self.assertEqual(app.normalize_effects(["particles", "snap", "normal", "bogus"]),

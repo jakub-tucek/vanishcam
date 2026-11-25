@@ -78,8 +78,12 @@ class SnapRecognizer:
 
     def recognize_snap(self, image: mp.Image, timestamp_ms: int, now: float) -> bool:
         hands = self.landmarker.detect_for_video(image, timestamp_ms).hand_landmarks
+        return self.observe(hands, image.width, image.height, now)
+
+    def observe(self, hands, width: int, height: int, now: float) -> bool:
+        """Check hand landmarks someone else already detected on this frame."""
         self.last_hand_count = len(hands)
-        return self.detector.update(hands, image.width, image.height, now)
+        return self.detector.update(hands, width, height, now)
 
     def describe(self) -> str:
         if not self.last_hand_count:

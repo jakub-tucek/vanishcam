@@ -134,6 +134,8 @@ def load_settings() -> dict:
 
 
 V_SIGN_RIVALS = {"normal": "particles", "particles": "normal"}
+# These run the same hand landmarker on the plain frame, so one pass per frame can feed all.
+HAND_EFFECTS = ("naruto", "snap", "clones")
 
 
 def normalize_effects(names) -> list[str]:
@@ -1028,6 +1030,7 @@ class MultiViewGestureRecognizer:
         self.preferred_crop: str | None = None
         self.next_retry_ms = 0
         self.retry_cursor = 0
+        self.retry_views = 3
 
     def recognize_gesture(self, image: mp.Image, timestamp_ms: int) -> tuple[str, float]:
         result = self.primary.recognize_for_video(image, timestamp_ms)
@@ -1059,7 +1062,7 @@ class MultiViewGestureRecognizer:
         if preferred in views:
             selected.append(preferred)
         # Spread the expensive IMAGE attempts over successive video frames.
-        while len(selected) < 3:
+        while len(selected) < self.retry_views:
             view = views[self.retry_cursor % len(views)]
             self.retry_cursor += 1
             if view not in selected:
@@ -1105,8 +1108,12 @@ class MultiViewHandLandmarker:
 
     def recognize_joined_hands(self, image: mp.Image, timestamp_ms: int) -> bool:
         result = self.primary.detect_for_video(image, timestamp_ms)
-        self.last_hand_count = len(result.hand_landmarks)
-        self.last_seal = analyze_hand_seal(result.hand_landmarks, image.width, image.height)
+        return self.observe(result.hand_landmarks, image.width, image.height)
+
+    def observe(self, hands, width: int, height: int) -> bool:
+        """Check hand landmarks someone else already detected on this frame."""
+        self.last_hand_count = len(hands)
+        self.last_seal = analyze_hand_seal(hands, width, height)
         return self.last_seal.ok
 
     def close(self) -> None:
@@ -1463,6 +1470,18 @@ def run_camera(args: argparse.Namespace, resources: ExitStack, mode: str,
     last_timestamp = [-1]
     timestamp_floor = 0
 
+    frame_hands: list = [None, None]  # (frame number, landmarks) of the shared hand pass.
+
+    def sharing_hands() -> bool:
+        return sum(name in enabled for name in HAND_EFFECTS) > 1
+
+    def shared_hands(image: mp.Image) -> list:
+        if frame_hands[0] != frame_number:
+            source = kits[next(name for name in HAND_EFFECTS if name in enabled)][1]
+            landmarker = getattr(source, "landmarker", None) or source.primary
+            frame_hands[:] = [frame_number, landmarker.detect_for_video(image, stamp()).hand_landmarks]
+        return frame_hands[1]
+
     def stamp() -> int:
         last_timestamp[0] = max(last_timestamp[0] + 1, timestamp_floor)
         return last_timestamp[0]
@@ -1540,7 +1559,9 @@ def run_camera(args: argparse.Namespace, resources: ExitStack, mode: str,
 
     raise_pending = True
     try:
+        frame_number = 0
         while True:
+            frame_number += 1
             switched = switcher.poll()
             if switched is not None:
                 index, new_capture = switched
@@ -1647,7 +1668,8 @@ def run_camera(args: argparse.Namespace, resources: ExitStack, mode: str,
                     # Every frame: a snap is over within one or two frames.
                     if mp_image is None:
                         mp_image = to_mp_image(camera_frame)
-                    snapped = recognizer.recognize_snap(mp_image, stamp(), now)
+                    snapped = (recognizer.observe(shared_hands(mp_image), width, height, now)
+                               if sharing_hands() else recognizer.recognize_snap(mp_image, stamp(), now))
                     hud_detail = recognizer.describe()
                     if args.gesture_debug and (snapped or now - last_reports.get(mode, 0.0) >= 1.0):
                         print(f"[Snap] hands={recognizer.last_hand_count} "
@@ -1662,7 +1684,8 @@ def run_camera(args: argparse.Namespace, resources: ExitStack, mode: str,
                     last_checks[mode] = now
                     if mp_image is None:
                         mp_image = to_mp_image(camera_frame)
-                    sealed = recognizer.recognize_seal(mp_image, stamp())
+                    sealed = (recognizer.observe(shared_hands(mp_image), width, height)
+                              if sharing_hands() else recognizer.recognize_seal(mp_image, stamp()))
                     hud_detail = recognizer.last_seal.describe()
                     if args.gesture_debug and now - last_reports.get(mode, 0.0) >= 1.0:
                         measures = " ".join(f"{name}={value:.2f}" for name, value
@@ -1683,6 +1706,8 @@ def run_camera(args: argparse.Namespace, resources: ExitStack, mode: str,
                     last_checks[mode] = now
                     mp_image = to_mp_image(camera_frame)
                     if mode != "naruto":
+                        # Rotated retry views are costly; with other effects watching, try fewer.
+                        recognizer.retry_views = 1 if len(enabled) > 1 else 3
                         name, score = recognize_gesture(recognizer, mp_image, stamp())
                         hud_detail = ("No hand in view" if name == "No_Hand"
                                       else f"Seen: {name} ({score:.0%}, needs V sign over 62%)")
@@ -1695,7 +1720,9 @@ def run_camera(args: argparse.Namespace, resources: ExitStack, mode: str,
                             last_reports[mode] = now
                         start_vanish_on_gesture(state, name, score, now)
                     else:
-                        joined = recognizer.recognize_joined_hands(mp_image, stamp())
+                        joined = (recognizer.observe(shared_hands(mp_image), width, height)
+                                  if sharing_hands()
+                                  else recognizer.recognize_joined_hands(mp_image, stamp()))
                         hud_detail = recognizer.last_seal.describe()
                         if args.gesture_debug and now - last_reports.get(mode, 0.0) >= 1.0:
                             measures = " ".join(f"{name}={value:.2f}" for name, value

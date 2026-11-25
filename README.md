@@ -228,9 +228,6 @@ orientation (the preview is mirrored, like a mirror).
 ./vanishcam --self-test   # checks models, assets and audio without opening a camera
 ```
 
-GitHub Actions runs the launcher, the tests and `--self-test` on Linux, Windows and macOS
-(`.github/workflows/tests.yml`).
-
 Layout: `bootstrap.py` (venv setup), `vanish_cam.py` (app, overlay, camera switching), `*_effect.py` (effects),
 `vanish_sound.py`, `mediapipe_log_filter.py` (quiets MediaPipe logs), `backgrounds/`, `models/`,
 `assets/`, `tests/`.

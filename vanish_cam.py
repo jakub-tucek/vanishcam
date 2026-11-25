@@ -41,6 +41,7 @@ from naruto_effect import (
 )
 from snap_effect import SNAP_SECONDS, SnapRecognizer, render_snap, snap_anchor
 from clone_effect import CLONE_SECONDS, CloneSealRecognizer, CloneSquad
+from gesture_worker import GestureJob, GestureWorker, Observation
 from vanish_sound import SOUND_PATH, TELEPORT_SOUND_PATH, VanishSound
 
 
@@ -1142,6 +1143,78 @@ def start_vanish_on_gesture(state: AppState, name: str, score: float, now: float
     return False
 
 
+# Seconds between checks per effect; a snap lasts a frame or two, so it is checked every frame.
+CHECK_INTERVALS = {"normal": GESTURE_INTERVAL_SECONDS, "particles": GESTURE_INTERVAL_SECONDS,
+                   "naruto": 0.08, "goku": 0.10, "itachi": 0.09, "snap": 0.0, "clones": 0.08}
+# Phases other than "ready" in which an effect still listens (to bring you back).
+LISTENING_PHASES = {"goku": "vanished", "itachi": "vanished", "snap": "vanished", "clones": "cloned"}
+DEBUG_PREFIXES = {"normal": "Gesture", "particles": "Gesture", "naruto": "Hands", "goku": "Goku",
+                  "itachi": "Itachi", "snap": "Snap", "clones": "Clones"}
+GESTURE_THREAD = True
+
+
+def _measures(values: dict[str, float]) -> str:
+    return " ".join(f"{name}={value:.2f}" for name, value in values.items())
+
+
+def observe_gestures(job: GestureJob, stamp) -> list[Observation]:
+    """Run each due recognizer on the job's frame (on the gesture thread)."""
+    image, width, height = job.image, job.width, job.height
+    shared: list = []
+
+    def hands() -> list:
+        if not shared:
+            shared.append(job.hand_source.detect_for_video(image, stamp()).hand_landmarks)
+        return shared[0]
+
+    observations = []
+    for mode in job.modes:
+        recognizer, debug = job.recognizers[mode], ""
+        if mode == "itachi":
+            value = recognizer.recognize_pose(image, stamp())
+            detail = recognizer.last_cross.describe()
+            if job.debug:
+                debug = f"crossed={value} {_measures(recognizer.last_cross.measures)}"
+        elif mode == "goku":
+            value = recognizer.recognize_pose(image, stamp())
+            detail = (f"Face seen: {'yes' if recognizer.last_face_count else 'no'}   "
+                      f"hands: {recognizer.last_hand_count}   "
+                      f"fingers on forehead: {'yes' if value else 'no'}")
+            if job.debug:
+                debug = (f"faces={recognizer.last_face_count}, "
+                         f"hands={recognizer.last_hand_count}, pose={value}")
+        elif mode == "snap":
+            value = (recognizer.observe(hands(), width, height, job.now) if job.hand_source
+                     else recognizer.recognize_snap(image, stamp(), job.now))
+            detail = recognizer.describe()
+            if job.debug:
+                debug = (f"hands={recognizer.last_hand_count} "
+                         f"pinch={recognizer.detector.pinched} snap={value}")
+        elif mode in ("clones", "naruto"):
+            if job.hand_source:
+                value = recognizer.observe(hands(), width, height)
+            elif mode == "clones":
+                value = recognizer.recognize_seal(image, stamp())
+            else:
+                value = recognizer.recognize_joined_hands(image, stamp())
+            seal = recognizer.last_seal
+            detail = seal.describe()
+            if job.debug:
+                count = seal.hands if mode == "clones" else recognizer.last_hand_count
+                debug = f"hands={count} seal={value} {_measures(seal.measures)}"
+        else:
+            recognizer.retry_views = job.v_retry_views
+            value = recognize_gesture(recognizer, image, stamp())
+            name, score = value
+            detail = ("No hand in view" if name == "No_Hand"
+                      else f"Seen: {name} ({score:.0%}, needs V sign over 62%)")
+            if job.debug:
+                debug = (f"{name}, score={score:.2f}, crop={recognizer.preferred_crop or 'full'}, "
+                         f"rotation={recognizer.preferred_rotation or 0}")
+        observations.append(Observation(mode, value, detail, debug))
+    return observations
+
+
 NARUTO_HOLD_SECONDS = 0.3
 CLONE_HOLD_SECONDS = 0.3
 ITACHI_HOLD_SECONDS = 0.3
@@ -1470,21 +1543,16 @@ def run_camera(args: argparse.Namespace, resources: ExitStack, mode: str,
     last_timestamp = [-1]
     timestamp_floor = 0
 
-    frame_hands: list = [None, None]  # (frame number, landmarks) of the shared hand pass.
-
-    def sharing_hands() -> bool:
-        return sum(name in enabled for name in HAND_EFFECTS) > 1
-
-    def shared_hands(image: mp.Image) -> list:
-        if frame_hands[0] != frame_number:
-            source = kits[next(name for name in HAND_EFFECTS if name in enabled)][1]
-            landmarker = getattr(source, "landmarker", None) or source.primary
-            frame_hands[:] = [frame_number, landmarker.detect_for_video(image, stamp()).hand_landmarks]
-        return frame_hands[1]
+    stamp_lock = threading.Lock()
 
     def stamp() -> int:
-        last_timestamp[0] = max(last_timestamp[0] + 1, timestamp_floor)
-        return last_timestamp[0]
+        # Called from the gesture thread too; each MediaPipe task needs rising timestamps.
+        with stamp_lock:
+            last_timestamp[0] = max(last_timestamp[0] + 1, timestamp_floor)
+            return last_timestamp[0]
+
+    worker = GestureWorker(lambda job: observe_gestures(job, stamp), threaded=GESTURE_THREAD)
+    details: dict[str, str] = {}
 
     def play_sound() -> None:
         if vanish_sound is not None and not muted:
@@ -1559,9 +1627,7 @@ def run_camera(args: argparse.Namespace, resources: ExitStack, mode: str,
 
     raise_pending = True
     try:
-        frame_number = 0
         while True:
-            frame_number += 1
             switched = switcher.poll()
             if switched is not None:
                 index, new_capture = switched
@@ -1601,143 +1667,91 @@ def run_camera(args: argparse.Namespace, resources: ExitStack, mode: str,
             scene_background = style.plate(background)
 
             # Ready: every enabled effect watches for its gesture; the first to fire becomes
-            # the active one. Busy or vanished: only the active effect, which brings you back.
+            # the active one. Vanished (or clones out): only the active effect, to bring you
+            # back. Recognition runs on the gesture thread; decisions stay here.
+            listening = background is not None and gestures_enabled and (
+                state.phase == "ready" or LISTENING_PHASES.get(mode) == state.phase)
+            watched = (list(enabled) if state.phase == "ready" else [mode]) if listening else []
+            due = [name for name in watched
+                   if now - last_checks.get(name, float("-inf")) >= CHECK_INTERVALS[name]]
+            if due and not worker.busy:
+                hand_effects = [name for name in HAND_EFFECTS if name in enabled]
+                source = kits[hand_effects[0]][1] if len(hand_effects) > 1 else None
+                if mp_image is None:
+                    mp_image = to_mp_image(camera_frame)
+                if worker.submit(GestureJob(
+                        image=mp_image, width=width, height=height, now=now,
+                        phase=state.phase, modes=tuple(due), debug=bool(args.gesture_debug),
+                        recognizers={name: load_kit(name)[1] for name in due},
+                        hand_source=source and (getattr(source, "landmarker", None) or source.primary),
+                        v_retry_views=1 if len(enabled) > 1 else 3)):
+                    for name in due:
+                        last_checks[name] = now
+            finished = worker.poll()
             focus = mode
-            watched = list(enabled) if state.phase == "ready" else [mode]
-            for candidate in watched:
-                if candidate != mode:
-                    mode = candidate
+            for observation in (finished[1] if finished else ()):
+                job = finished[0]
+                if (not gestures_enabled or state.phase != job.phase
+                        or observation.mode not in enabled):
+                    break  # Stale: something else happened since this frame was sent.
+                checked_at, value = job.now, observation.value
+                if observation.mode != mode:
+                    mode = observation.mode
                     segmenter, recognizer, log_sprite, vanish_sound = load_kit(mode)
-                if (gestures_enabled and mode == "itachi" and background is not None
-                        and state.phase in ("ready", "vanished")
-                        and now - last_checks.get(mode, 0.0) >= 0.09):
-                    last_checks[mode] = now
-                    mp_image = to_mp_image(camera_frame)
-                    crossed = recognizer.recognize_pose(mp_image, stamp())
-                    hud_detail = recognizer.last_cross.describe()
-                    if args.gesture_debug and now - last_reports.get(mode, 0.0) >= 1.0:
-                        measures = " ".join(f"{name}={value:.2f}" for name, value
-                                            in recognizer.last_cross.measures.items())
-                        print(f"[Itachi] crossed={crossed} {measures}")
-                        last_reports[mode] = now
-                    if itachi_gate.update(crossed, now):
-                        mask = person_mask(segmenter, mp_image, stamp(), width, height)
-                        last_mask, last_mask_at = mask, now
-                        try:
-                            itachi_effect = ItachiCrowEffect(scene_frame, mask)
-                        except ValueError:
-                            itachi_gate.reset()
-                        else:
-                            appearing = state.phase == "vanished"
-                            state.phase = "itachi_appearing" if appearing else "itachi_disappearing"
-                            state.vanish_started = now
-                            vanished_frame = None
-                            print("[Itachi] Crows reassembling." if appearing
-                                  else "[Itachi] Scattering into crows.")
-
-                if (gestures_enabled and mode == "goku" and background is not None
-                        and state.phase in ("ready", "vanished")
-                        and now - last_checks.get(mode, 0.0) >= 0.10):
-                    last_checks[mode] = now
-                    mp_image = to_mp_image(camera_frame)
-                    pose = recognizer.recognize_pose(mp_image, stamp())
-                    hud_detail = (f"Face seen: {'yes' if recognizer.last_face_count else 'no'}   "
-                                  f"hands: {recognizer.last_hand_count}   "
-                                  f"fingers on forehead: {'yes' if pose else 'no'}")
-                    if args.gesture_debug and now - last_reports.get(mode, 0.0) >= 1.0:
-                        held = 0.0 if goku_gate.hold_started is None else now - goku_gate.hold_started
-                        print(f"[Goku] faces={recognizer.last_face_count}, "
-                              f"hands={recognizer.last_hand_count}, pose={pose}, "
-                              f"hold={held:.2f}/{goku_gate.hold_seconds:g} s")
-                        last_reports[mode] = now
-                    if goku_gate.update(pose, now):
-                        teleport_goku(mp_image)
-                    elif pose and goku_gate.armed and goku_gate.hold_started is not None:
-                        left = goku_gate.hold_seconds - (now - goku_gate.hold_started)
-                        remaining = (max(.1,float(np.ceil(left*10)/10)) if goku_gate.hold_seconds < 1
-                                     else max(1,int(np.ceil(left))))
+                details[mode] = observation.detail
+                if args.gesture_debug and (now - last_reports.get(mode, 0.0) >= 1.0
+                                           or (mode == "snap" and value)):
+                    extra = ""
+                    if mode == "goku":
+                        held = 0.0 if goku_gate.hold_started is None else checked_at - goku_gate.hold_started
+                        extra = f", hold={held:.2f}/{goku_gate.hold_seconds:g} s"
+                    print(f"[{DEBUG_PREFIXES[mode]}] {observation.debug}{extra}")
+                    last_reports[mode] = now
+                if mode == "itachi" and itachi_gate.update(value, checked_at):
+                    fresh = to_mp_image(camera_frame)
+                    mask = person_mask(segmenter, fresh, stamp(), width, height)
+                    last_mask, last_mask_at = mask, now
+                    try:
+                        itachi_effect = ItachiCrowEffect(scene_frame, mask)
+                    except ValueError:
+                        itachi_gate.reset()
+                    else:
+                        appearing = state.phase == "vanished"
+                        state.phase = "itachi_appearing" if appearing else "itachi_disappearing"
+                        state.vanish_started = now
+                        vanished_frame = None
+                        print("[Itachi] Crows reassembling." if appearing
+                              else "[Itachi] Scattering into crows.")
+                elif mode == "goku":
+                    if goku_gate.update(value, checked_at):
+                        teleport_goku(to_mp_image(camera_frame))
+                    elif value and goku_gate.armed and goku_gate.hold_started is not None:
+                        left = goku_gate.hold_seconds - (checked_at - goku_gate.hold_started)
+                        remaining = (max(.1, float(np.ceil(left * 10) / 10)) if goku_gate.hold_seconds < 1
+                                     else max(1, int(np.ceil(left))))
                         if remaining != goku_countdown_remaining:
                             action = "Reappearance" if state.phase == "vanished" else "Disappearance"
                             print(f"[Goku] {action} in {remaining:g}...")
                             goku_countdown_remaining = remaining
                     elif goku_gate.hold_started is None:
                         goku_countdown_remaining = None
-
-                if (gestures_enabled and mode == "snap" and background is not None
-                        and state.phase in ("ready", "vanished")):
-                    # Every frame: a snap is over within one or two frames.
-                    if mp_image is None:
-                        mp_image = to_mp_image(camera_frame)
-                    snapped = (recognizer.observe(shared_hands(mp_image), width, height, now)
-                               if sharing_hands() else recognizer.recognize_snap(mp_image, stamp(), now))
-                    hud_detail = recognizer.describe()
-                    if args.gesture_debug and (snapped or now - last_reports.get(mode, 0.0) >= 1.0):
-                        print(f"[Snap] hands={recognizer.last_hand_count} "
-                              f"pinch={recognizer.detector.pinched} snap={snapped}")
-                        last_reports[mode] = now
-                    if snapped:
-                        start_snap(mp_image, appearing=state.phase == "vanished")
-
-                if (gestures_enabled and mode == "clones" and background is not None
-                        and state.phase in ("ready", "cloned")
-                        and now - last_checks.get(mode, 0.0) >= 0.08):
-                    last_checks[mode] = now
-                    if mp_image is None:
-                        mp_image = to_mp_image(camera_frame)
-                    sealed = (recognizer.observe(shared_hands(mp_image), width, height)
-                              if sharing_hands() else recognizer.recognize_seal(mp_image, stamp()))
-                    hud_detail = recognizer.last_seal.describe()
-                    if args.gesture_debug and now - last_reports.get(mode, 0.0) >= 1.0:
-                        measures = " ".join(f"{name}={value:.2f}" for name, value
-                                            in recognizer.last_seal.measures.items())
-                        print(f"[Clones] hands={recognizer.last_seal.hands} seal={sealed} {measures}")
-                        last_reports[mode] = now
-                    if clone_gate.update(sealed, now):
-                        start_clones(mp_image, appearing=state.phase == "ready")
-
-                if (
-                    gestures_enabled
-                    and background is not None
-                    and state.phase == "ready"
-                    and mode not in ("goku", "itachi", "snap", "clones")
-                    and now - last_checks.get(mode, 0.0) >=
-                    (0.08 if mode == "naruto" else GESTURE_INTERVAL_SECONDS)
-                ):
-                    last_checks[mode] = now
-                    mp_image = to_mp_image(camera_frame)
-                    if mode != "naruto":
-                        # Rotated retry views are costly; with other effects watching, try fewer.
-                        recognizer.retry_views = 1 if len(enabled) > 1 else 3
-                        name, score = recognize_gesture(recognizer, mp_image, stamp())
-                        hud_detail = ("No hand in view" if name == "No_Hand"
-                                      else f"Seen: {name} ({score:.0%}, needs V sign over 62%)")
-                        if args.gesture_debug and now - last_reports.get(mode, 0.0) >= 1.0:
-                            print(
-                                f"[Gesture] {name}, score={score:.2f}, "
-                                f"crop={recognizer.preferred_crop or 'full'}, "
-                                f"rotation={recognizer.preferred_rotation or 0}"
-                            )
-                            last_reports[mode] = now
-                        start_vanish_on_gesture(state, name, score, now)
-                    else:
-                        joined = (recognizer.observe(shared_hands(mp_image), width, height)
-                                  if sharing_hands()
-                                  else recognizer.recognize_joined_hands(mp_image, stamp()))
-                        hud_detail = recognizer.last_seal.describe()
-                        if args.gesture_debug and now - last_reports.get(mode, 0.0) >= 1.0:
-                            measures = " ".join(f"{name}={value:.2f}" for name, value
-                                                in recognizer.last_seal.measures.items())
-                            print(f"[Hands] detected={recognizer.last_hand_count}, seal={joined} "
-                                  f"{measures}")
-                            last_reports[mode] = now
-                        if start_naruto_on_join(state, naruto_gate, joined, now):
-                            play_sound()
-                if state.phase != "ready":
+                elif mode == "snap" and value:
+                    start_snap(to_mp_image(camera_frame), appearing=state.phase == "vanished")
+                elif mode == "clones" and clone_gate.update(value, checked_at):
+                    start_clones(to_mp_image(camera_frame), appearing=state.phase == "ready")
+                elif mode == "naruto":
+                    if start_naruto_on_join(state, naruto_gate, value, checked_at):
+                        play_sound()
+                elif mode in ("normal", "particles"):
+                    start_vanish_on_gesture(state, *value, checked_at)
+                if state.phase != job.phase:
                     break
             if state.phase == "ready" and mode != focus:
                 mode = focus
                 segmenter, recognizer, log_sprite, vanish_sound = load_kit(mode)
-            if gestures_enabled and state.phase == "ready" and len(watched) > 1:
+            if listening:
+                hud_detail = details.get(mode, "")
+            if listening and state.phase == "ready" and len(watched) > 1:
                 hud_detail = "Watching: " + ", ".join(MODE_LABELS[name][0] for name in watched)
             if mode == "normal" and (dissolve_field is None or dissolve_field.shape != (height, width)):
                 dissolve_field, sparkle_noise = make_dissolve_fields(height, width)
@@ -2039,6 +2053,7 @@ def run_camera(args: argparse.Namespace, resources: ExitStack, mode: str,
                     perf_samples.clear()
                     perf_report_at = loop_end
     finally:
+        worker.close()
         resources.close()
 
     return 0

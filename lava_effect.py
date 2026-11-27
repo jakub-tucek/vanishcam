@@ -161,8 +161,15 @@ class LavaEffect:
         lava = lava * pulse[:, :, None] + PALETTE[(heat * 255).astype(np.uint8)] * (near * 0.3)[:, :, None]
         return lava, heat
 
-    def render(self, background: np.ndarray, age: float, appearing: bool = False) -> np.ndarray:
-        """Frame at age seconds; appearing plays the same sequence backwards."""
+    def render(self, background: np.ndarray, age: float, appearing: bool = False,
+               frame: np.ndarray | None = None, mask: np.ndarray | None = None) -> np.ndarray:
+        """Frame at age seconds; appearing plays the same sequence backwards.
+
+        frame and mask are the live person, so they keep moving while they sink or rise;
+        without them the snapshot from the gesture is used.
+        """
+        frame = self.frame if frame is None else frame
+        mask = self.mask if mask is None else mask
         if appearing:
             age = LAVA_SECONDS - age
         width, height = self.size
@@ -177,8 +184,8 @@ class LavaEffect:
         output = background.astype(np.float32)
         if drop < self.sink_depth:
             matrix = np.float32([[1, 0, 0], [0, 1, drop]])
-            person = cv2.warpAffine(self.frame, matrix, (width, height)).astype(np.float32)
-            alpha = cv2.warpAffine(self.mask, matrix, (width, height)) * (rows < line[None, :])
+            person = cv2.warpAffine(frame, matrix, (width, height)).astype(np.float32)
+            alpha = cv2.warpAffine(mask.astype(np.float32), matrix, (width, height)) * (rows < line[None, :])
             if rise > 0:
                 # Close to the surface the body glows red-hot, then chars just above it.
                 heat = np.clip(1 - (line[None, :] - rows) / self.band, 0, 1)[:, :, None]

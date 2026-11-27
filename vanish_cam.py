@@ -1613,13 +1613,18 @@ def run_camera(args: argparse.Namespace, resources: ExitStack, mode: str,
         play_sound()
         print("[Snap] Reappearing." if appearing else "[Snap] Vanishing.")
 
+    def with_person(mask: np.ndarray) -> np.ndarray:
+        """The styled scene with the person in it, also while they are vanished (when the
+        style paints over them)."""
+        return alpha_composite(camera_frame, style.scene(camera_frame, False), mask)
+
     def start_lava(image: mp.Image, appearing: bool) -> None:
         """Sink into the lava, or rise from it (the person is standing there, hidden)."""
         nonlocal lava_effect, last_mask, last_mask_at, vanished_frame
         mask = person_mask(segmenter, image, stamp(), width, height)
         last_mask, last_mask_at = mask, time.perf_counter()
         try:
-            lava_effect = LavaEffect(scene_frame, mask)
+            lava_effect = LavaEffect(with_person(mask), mask)
         except ValueError:
             print("[Lava] Step into the frame first." if appearing else "[Lava] No person detected.")
             return
@@ -1760,7 +1765,7 @@ def run_camera(args: argparse.Namespace, resources: ExitStack, mode: str,
                     mask = person_mask(segmenter, fresh, stamp(), width, height)
                     last_mask, last_mask_at = mask, now
                     try:
-                        itachi_effect = ItachiCrowEffect(scene_frame, mask)
+                        itachi_effect = ItachiCrowEffect(with_person(mask), mask)
                     except ValueError:
                         itachi_gate.reset()
                     else:
@@ -1850,7 +1855,13 @@ def run_camera(args: argparse.Namespace, resources: ExitStack, mode: str,
             elif mode == "lava" and state.phase in ("lava_sinking", "lava_rising"):
                 appearing = state.phase == "lava_rising"
                 age = max(0.0, time.perf_counter() - state.vanish_started)
-                display = lava_effect.render(scene_background, age, appearing)
+                if now - last_mask_at >= 0.05:
+                    if mp_image is None:
+                        mp_image = to_mp_image(camera_frame)
+                    last_mask = person_mask(segmenter, mp_image, stamp(), width, height)
+                    last_mask_at = now
+                display = lava_effect.render(scene_background, age, appearing,
+                                             frame=with_person(last_mask), mask=last_mask)
                 if age >= LAVA_SECONDS:
                     state.phase = "ready" if appearing else "vanished"
                     vanished_frame = None
@@ -2056,7 +2067,7 @@ def run_camera(args: argparse.Namespace, resources: ExitStack, mode: str,
                     mp_image = to_mp_image(camera_frame)
                     mask = person_mask(segmenter, mp_image, stamp(), width, height)
                     try:
-                        itachi_effect = ItachiCrowEffect(scene_frame, mask)
+                        itachi_effect = ItachiCrowEffect(with_person(mask), mask)
                     except ValueError:
                         print("[Itachi] Step back into the frame before reappearing.")
                     else:

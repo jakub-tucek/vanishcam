@@ -1,4 +1,5 @@
 import unittest
+import unittest.mock
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -55,6 +56,15 @@ class LavaRenderTests(unittest.TestCase):
         drained = self.effect.render(self.background, LAVA_SECONDS)
         self.assertLess(drained[110, :, 2].mean(), 5)
 
+    def test_live_person_is_drawn_instead_of_the_snapshot(self):
+        live = self.background.copy()
+        live[self.mask > 0] = (255, 0, 0)
+        rising = self.effect.render(self.background, LAVA_SECONDS * 0.95, appearing=True,
+                                    frame=live, mask=self.mask)
+        blue = (rising[:, :, 0] > 150) & (rising[:, :, 1] < 80)
+        self.assertGreater(int(blue.sum()), 500)
+        self.assertEqual(self.person_pixels(rising), 0)
+
     def test_nobody_to_sink(self):
         with self.assertRaises(ValueError):
             LavaEffect(self.frame, np.zeros_like(self.mask))
@@ -73,6 +83,23 @@ class LavaLoopTests(unittest.TestCase):
         _, messages = self.run_loop("lava", times, (0,) * 12 + (ord("q"),), recognizer=recognizer)
         self.assertEqual([m for m in messages if m.startswith("[Lava]")],
                          ["[Lava] Sinking into the lava.", "[Lava] Rising from the lava."])
+
+    def test_rising_draws_the_live_person_with_a_background_style_on(self):
+        # With blur or an image on, the vanished scene has the person painted over; the
+        # rise must still show them, from the live camera frame, on every frame.
+        effect = Mock()
+        effect.return_value.render.side_effect = lambda background, *a, **k: background
+        times = (0.1, 4.1, 4.3, 9.0, 9.1, 9.2, 9.3)
+        keys = (ord("g"), ord("v"), 0, ord("r"), 0, 0, ord("q"))
+        _, messages = self.run_loop("lava", times, keys, recognizer=Mock(),
+                                    extra=(unittest.mock.patch.object(app, "LavaEffect", effect),),
+                                    background="blur")
+        self.assertIn("[Lava] Rising from the lava.", messages)
+        rising = [c for c in effect.return_value.render.call_args_list if c.args[2] is True]
+        self.assertGreaterEqual(len(rising), 2)
+        for call in rising:
+            self.assertIsNotNone(call.kwargs["frame"])
+            self.assertIsNotNone(call.kwargs["mask"])
 
     def test_v_and_r_with_gestures_off(self):
         recognizer = Mock()

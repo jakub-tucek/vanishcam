@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from functools import lru_cache
+
 import cv2
 import mediapipe as mp
 import numpy as np
@@ -31,6 +33,66 @@ def _noise(height: int, width: int, rng: np.random.Generator, cell: int) -> np.n
     return cv2.resize(small, (width, height), interpolation=cv2.INTER_CUBIC)
 
 
+def _fbm(height: int, width: int, rng: np.random.Generator, cell: int, octaves: int = 4) -> np.ndarray:
+    """Fractal noise: several octaves of smooth noise, finer ones weaker."""
+    total, weight, norm = np.zeros((height, width), np.float32), 1.0, 0.0
+    for _ in range(octaves):
+        total += _noise(height, width, rng, max(2, cell)) * weight
+        norm += weight
+        cell, weight = cell // 2, weight * 0.5
+    return total / norm
+
+
+@lru_cache(maxsize=2)
+def lava_texture(height: int, width: int, seed: int = 77) -> tuple[np.ndarray, np.ndarray]:
+    """(BGR colour, emission 0..1) of a tileable-in-x molten surface seen from above.
+
+    Cooled crust plates (Voronoi cells) with rough lit surfaces, separated by cracks whose
+    incandescent core fades through yellow and orange to red; crust edges facing a crack
+    pick up its red glow.
+    """
+    rng = np.random.default_rng(seed)
+    # Voronoi plates: label each pixel with its nearest seed point; plate borders are cracks.
+    count = max(24, width * height // 2600)
+    seeds = np.zeros((height, width), np.uint8)
+    points = np.column_stack([rng.integers(0, height, count), rng.integers(0, width, count)])
+    seeds[points[:, 0], points[:, 1]] = 1
+    # Wrap horizontally so the texture scrolls seamlessly: label a tripled strip.
+    wide = np.hstack([seeds, seeds, seeds])
+    _, labels = cv2.distanceTransformWithLabels(1 - wide, cv2.DIST_L2, 5,
+                                                labelType=cv2.DIST_LABEL_CCOMP)
+    labels = labels[:, width:2 * width]
+    border = np.zeros((height, width), np.uint8)
+    border[:, :-1] |= (labels[:, :-1] != labels[:, 1:]).astype(np.uint8)
+    border[:-1, :] |= (labels[:-1, :] != labels[1:, :]).astype(np.uint8)
+    # Distort the straight Voronoi edges into ragged cracks.
+    warp_x = (_fbm(height, width, rng, 48) - 0.5) * 26
+    warp_y = (_fbm(height, width, rng, 48) - 0.5) * 26
+    grid_x, grid_y = np.meshgrid(np.arange(width, dtype=np.float32), np.arange(height, dtype=np.float32))
+    border = cv2.remap(border * 255, grid_x + warp_x, grid_y + warp_y, cv2.INTER_LINEAR,
+                       borderMode=cv2.BORDER_WRAP)
+    distance = cv2.distanceTransform((border < 128).astype(np.uint8), cv2.DIST_L2, 5)
+    # Crack width varies along its length: wide molten rivers to hairline seams.
+    width_map = 1.2 + _fbm(height, width, rng, 64) ** 2 * 9
+    glow = np.exp(-distance / width_map)
+    rough = _fbm(height, width, rng, 32, octaves=5)
+    emission = np.clip(glow * (0.75 + 0.5 * rough) - 0.05, 0, 1) ** 1.3
+    # Crust: dark basalt, shaded by its own roughness as if lit from the cracks below.
+    height_map = cv2.GaussianBlur(rough, (0, 0), 1.2)
+    gx = cv2.Sobel(height_map, cv2.CV_32F, 1, 0, ksize=3)
+    gy = cv2.Sobel(height_map, cv2.CV_32F, 0, 1, ksize=3)
+    shade = np.clip(0.55 + (gx * 0.6 - gy * 0.9) * 9, 0.15, 1.1)
+    crust = (np.array([22, 24, 30], np.float32) + rough[:, :, None] * np.array([28, 30, 38], np.float32))
+    crust = crust * shade[:, :, None]
+    # Red glow creeping onto crust edges next to cracks.
+    rim = np.exp(-distance / (width_map * 3.5))[:, :, None]
+    crust += rim * np.array([6, 30, 150], np.float32)
+    hot = PALETTE[(np.clip(emission * 1.08, 0, 1) * 255).astype(np.uint8)]
+    mix = np.clip(emission * 1.6, 0, 1)[:, :, None]
+    colour = crust * (1 - mix) + hot * mix
+    return colour.astype(np.float32), emission.astype(np.float32)
+
+
 class LavaEffect:
     """Renders one sinking (or, played backwards, rising) of the person captured at the gesture."""
 
@@ -48,14 +110,11 @@ class LavaEffect:
         self.body = (float(columns.mean()), max(8.0, (columns[-1] - columns[0]) / 2))
         self.band = max(12, int(height * HEAT_BAND))
         rng = np.random.default_rng(seed)
-        tex_h, tex_w = height, width * 2
-        # Slow molten flow, a ridged layer whose ridges become glowing cracks, cooled
-        # crust plates, and a warp field that keeps the whole surface churning.
-        self.flow = _noise(tex_h, tex_w, rng, max(8, width // 26))
-        ridged = 1 - np.abs(2 * _noise(tex_h, tex_w, rng, max(6, width // 40)) - 1)
-        self.cracks = ridged ** 7
-        self.crust = np.clip((_noise(tex_h, tex_w, rng, max(10, width // 16)) - 0.55) * 4, 0, 1)
-        self.warp = (_noise(tex_h, tex_w, rng, max(12, width // 12)) - 0.5) * (width / 22)
+        self.colour, self.emission = lava_texture(height, width, seed)
+        # Far texture is squeezed many times over; a blurred copy keeps its cracks from flickering.
+        self.colour_far = cv2.GaussianBlur(self.colour, (0, 0), 2.5)
+        self.emission_far = cv2.GaussianBlur(self.emission, (0, 0), 2.5)
+        self.warp = (_noise(height, width, rng, max(12, width // 12)) - 0.5) * (width / 40)
         count = 70
         self.embers = np.column_stack([rng.random(count) * width, rng.random(count),
                                        rng.random(count) * 0.6 + 0.35, rng.random(count)])
@@ -73,25 +132,33 @@ class LavaEffect:
     def _lava(self, age: float, top: int, level: float, line: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         width, height = self.size
         rows = np.arange(top, height, dtype=np.float32)[:, None]
-        depth = np.maximum(rows - level, 0)
-        # Perspective: texture rows are squeezed near the surface (far away) and open up
-        # towards the bottom edge (close by).
-        tex_y = depth * (0.45 + depth / (height * 0.35)) + 3
-        drift = float(age) * width * 0.035
-        map_y = np.broadcast_to(tex_y, (rows.shape[0], width)).astype(np.float32)
-        map_x = np.broadcast_to(self.x[None, :] + drift, map_y.shape).astype(np.float32)
+        # Depth below each column's own surface, so the heap around the body is textured too.
+        depth = np.maximum(rows - line[None, :], 0)
+        # Ground-plane perspective: the horizon sits a little above the surface, so texture
+        # is strongly squeezed at the far edge and close to life size at the bottom of frame.
+        horizon = height * 0.08
+        near_depth = height * 0.28
+        scale = near_depth / (depth + horizon)            # Texture pixels per screen pixel.
+        tex_y = near_depth ** 2 / (depth + horizon)
+        tex_y = (near_depth ** 2 / horizon - tex_y) % (height - 1)
+        drift = float(age) * width * 0.02
+        centre = width / 2
+        map_x = ((self.x[None, :] - centre) * scale + centre + drift).astype(np.float32)
+        map_y = np.broadcast_to(tex_y, map_x.shape).astype(np.float32)
         warp = cv2.remap(self.warp, map_x, map_y, cv2.INTER_LINEAR, borderMode=cv2.BORDER_WRAP)
-        flow = cv2.remap(self.flow, (map_x + warp).astype(np.float32), map_y, cv2.INTER_LINEAR, borderMode=cv2.BORDER_WRAP)
-        cracks = cv2.remap(self.cracks, (map_x * 0.97 + warp * 0.6 - drift * 0.4).astype(np.float32), map_y,
-                           cv2.INTER_LINEAR, borderMode=cv2.BORDER_WRAP)
-        crust = cv2.remap(self.crust, (map_x * 0.95 + warp * 0.3 - drift * 0.7).astype(np.float32), map_y,
-                          cv2.INTER_LINEAR, borderMode=cv2.BORDER_WRAP)
-        pulse = 0.04 * np.sin(age * 5 + self.x[None, :] / 60)
-        near = np.exp(-(rows - line[None, :]).clip(0) / (self.band * 0.6))
-        heat = (0.25 + flow * 0.45 + cracks * 0.75 - crust * (0.55 - cracks * 0.5)
-                + near * 0.18 + pulse)
-        heat = np.clip(heat, 0, 1)
-        lava = PALETTE[(heat * 255).astype(np.uint8)]
+        map_x = (map_x + warp * np.sin(age * 0.7)).astype(np.float32)
+
+        def sample(texture):
+            return cv2.remap(texture, map_x, map_y, cv2.INTER_LINEAR, borderMode=cv2.BORDER_WRAP)
+
+        far = np.clip((scale - 1.5) / 3, 0, 1)
+        lava = sample(self.colour) * (1 - far[:, :, None]) + sample(self.colour_far) * far[:, :, None]
+        heat = sample(self.emission) * (1 - far) + sample(self.emission_far) * far
+        # The molten cracks breathe; the pool is hotter right at the surface where it churns.
+        pulse = 1 + 0.12 * np.sin(age * 4 + map_x / 45 + map_y / 30)
+        near = np.exp(-(rows - line[None, :]).clip(0) / (self.band * 0.5))
+        heat = np.clip(heat * pulse + near * 0.15, 0, 1)
+        lava = lava * pulse[:, :, None] + PALETTE[(heat * 255).astype(np.uint8)] * (near * 0.3)[:, :, None]
         return lava, heat
 
     def render(self, background: np.ndarray, age: float, appearing: bool = False) -> np.ndarray:
@@ -122,6 +189,15 @@ class LavaEffect:
         if rise <= 0:
             return np.clip(output, 0, 255).astype(np.uint8)
 
+        # The pool lights the room: an orange wash from below, fading with height, that
+        # tints what is there (multiplied) rather than painting over it.
+        flicker = 1 + 0.06 * np.sin(age * 17) + 0.04 * np.sin(age * 31 + 1)
+        reach = height * 0.16
+        start = max(0, int(line.min() - reach * 4.5))  # Below 1% of full strength above this.
+        lit = (np.exp(-np.clip(line[None, :] - rows[start:], 0, None) / reach) * rise * flicker)[:, :, None]
+        tint = np.array([0.05, 0.3, 0.8], np.float32)
+        output[start:] = output[start:] * (1 + lit * tint) + lit * np.array([0, 6, 22], np.float32)
+
         top = max(0, int(line.min()) - self.band)
         region = output[top:]
         local = rows[top:] - line[None, :]
@@ -134,7 +210,7 @@ class LavaEffect:
         map_y = (np.broadcast_to(rows[top:], map_x.shape) - top).astype(np.float32)
         region[:] = cv2.remap(region, map_x, map_y, cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
         glow = np.clip(1 + local / self.band, 0, 1) ** 2 * above
-        region += glow[:, :, None] * np.array([18, 80, 220], np.float32) * 0.7 * rise
+        region += glow[:, :, None] * np.array([10, 45, 140], np.float32) * 0.5 * rise
 
         lava, heat = self._lava(age, top, level, line)
         inside = (~above)[:, :, None]

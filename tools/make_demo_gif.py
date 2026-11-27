@@ -253,8 +253,11 @@ def main() -> None:
     lava = LavaEffect(frame, mask)
     speed = 1.4  # Shorten the 4.4 s sink for the GIF.
     clip = gesture(background, "thumbs", white, "thumbs") + [
-        lava.render(background, t * speed) for t in timeline(LAVA_SECONDS / speed)] + hold(background, 0.3)
-    clips.append(captioned(clip, "8", "Lava", "thumbs up: sink into the lava"))
+        lava.render(background, t * speed) for t in timeline(LAVA_SECONDS / speed)]
+    clip += hold(background, 0.3) + [
+        lava.render(background, t * speed, appearing=True) for t in timeline(LAVA_SECONDS / speed)]
+    clip += relax(background, "thumbs", white, "thumbs")
+    clips.append(captioned(clip, "8", "Lava", "thumbs up: sink into the lava, again to rise"))
 
     frames = [Image.fromarray(cv2.cvtColor(f, cv2.COLOR_BGR2RGB)) for clip in clips for f in clip]
     samples = frames[::max(1, len(frames) // 24)]

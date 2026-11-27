@@ -41,6 +41,7 @@ from naruto_effect import (
 )
 from snap_effect import SNAP_SECONDS, SnapRecognizer, render_snap, snap_anchor
 from clone_effect import CLONE_SECONDS, CloneSealRecognizer, CloneSquad
+from lava_effect import LAVA_SECONDS, LavaEffect, ThumbsUpRecognizer
 from gesture_worker import GestureJob, GestureWorker, Observation
 from vanish_sound import SOUND_PATH, TELEPORT_SOUND_PATH, VanishSound
 
@@ -55,7 +56,7 @@ GESTURE_MODEL = MODEL_DIR / "gesture_recognizer.task"
 HAND_MODEL = MODEL_DIR / "hand_landmarker.task"
 FACE_MODEL = MODEL_DIR / "blaze_face_short_range.tflite"
 POSE_MODEL = MODEL_DIR / "pose_landmarker_lite.task"
-ALL_MODES = ("normal", "naruto", "particles", "goku", "itachi", "snap", "clones")
+ALL_MODES = ("normal", "naruto", "particles", "goku", "itachi", "snap", "clones", "lava")
 
 MODEL_URLS = {
     SEGMENTER_MODEL: (
@@ -84,6 +85,7 @@ MODE_LABELS = {
     "itachi": ("Itachi", "Arms crossed  /  flock of crows"),
     "snap": ("Snap", "Finger snap  /  puff of smoke"),
     "clones": ("Clones", "Crossed fingers  /  shadow clones"),
+    "lava": ("Lava", "Thumbs up  /  sink into lava"),
 }
 GESTURE_HINTS = {
     "normal": "Show a V sign to vanish",
@@ -93,6 +95,7 @@ GESTURE_HINTS = {
     "itachi": "Cross your arms over your chest",
     "snap": "Snap your fingers to vanish",
     "clones": "Cross two fingers of each hand (+) for clones",
+    "lava": "Thumbs up to sink into the lava",
 }
 SETTINGS_PATH = (Path(os.environ.get("APPDATA") if os.name == "nt" and os.environ.get("APPDATA")
                       else os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config")
@@ -210,7 +213,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--virtual-device", help="Name of the virtual device to use")
     parser.add_argument(
         "--mode", choices=ALL_MODES,
-        help="Start with only this effect (default: last used; 1-7 toggle effects while running)",
+        help="Start with only this effect (default: last used; 1-8 toggle effects while running)",
     )
     parser.add_argument(
         "--effects", default=None, metavar="LIST",
@@ -538,7 +541,7 @@ def open_camera(index: int, width: int, height: int) -> cv2.VideoCapture:
 def create_tasks(mode: str = "normal") -> tuple[
     vision.ImageSegmenter,
     MultiViewGestureRecognizer | MultiViewHandLandmarker | GokuPoseRecognizer | ItachiPoseRecognizer
-    | SnapRecognizer | CloneSealRecognizer,
+    | SnapRecognizer | CloneSealRecognizer | ThumbsUpRecognizer,
 ]:
     segmenter_options = vision.ImageSegmenterOptions(
         base_options=python.BaseOptions(model_asset_path=str(SEGMENTER_MODEL)),
@@ -605,6 +608,20 @@ def create_tasks(mode: str = "normal") -> tuple[
             segmenter.close()
             raise
         return segmenter, (SnapRecognizer(hands) if mode == "snap" else CloneSealRecognizer(hands))
+    if mode == "lava":
+        segmenter = vision.ImageSegmenter.create_from_options(segmenter_options)
+        try:
+            thumbs = vision.GestureRecognizer.create_from_options(vision.GestureRecognizerOptions(
+                base_options=python.BaseOptions(model_asset_path=str(GESTURE_MODEL)),
+                running_mode=vision.RunningMode.VIDEO, num_hands=2,
+                min_hand_detection_confidence=0.35, min_hand_presence_confidence=0.35,
+                min_tracking_confidence=0.5,
+                canned_gesture_classifier_options=mp.tasks.components.processors.ClassifierOptions(
+                    category_allowlist=["Thumb_Up"])))
+        except Exception:
+            segmenter.close()
+            raise
+        return segmenter, ThumbsUpRecognizer(thumbs)
     if mode == "naruto":
         if not HAND_MODEL.is_file():
             raise RuntimeError(f"Hand model not found: {HAND_MODEL}")
@@ -732,7 +749,7 @@ def refine_mask_edges(mask: np.ndarray, frame: np.ndarray) -> np.ndarray:
     return np.clip(refined, 0.0, 1.0)
 
 
-LIVE_VANISH_MODES = frozenset(("normal", "particles", "goku", "snap"))
+LIVE_VANISH_MODES = frozenset(("normal", "particles", "goku", "snap", "lava"))
 
 
 def widen_mask(mask: np.ndarray) -> np.ndarray:
@@ -1145,11 +1162,14 @@ def start_vanish_on_gesture(state: AppState, name: str, score: float, now: float
 
 # Seconds between checks per effect; a snap lasts a frame or two, so it is checked every frame.
 CHECK_INTERVALS = {"normal": GESTURE_INTERVAL_SECONDS, "particles": GESTURE_INTERVAL_SECONDS,
-                   "naruto": 0.08, "goku": 0.10, "itachi": 0.09, "snap": 0.0, "clones": 0.08}
+                   "naruto": 0.08, "goku": 0.10, "itachi": 0.09, "snap": 0.0, "clones": 0.08,
+                   "lava": 0.09}
 # Phases other than "ready" in which an effect still listens (to bring you back).
-LISTENING_PHASES = {"goku": "vanished", "itachi": "vanished", "snap": "vanished", "clones": "cloned"}
+LISTENING_PHASES = {"goku": "vanished", "itachi": "vanished", "snap": "vanished", "clones": "cloned",
+                    "lava": "vanished"}
 DEBUG_PREFIXES = {"normal": "Gesture", "particles": "Gesture", "naruto": "Hands", "goku": "Goku",
-                  "itachi": "Itachi", "snap": "Snap", "clones": "Clones"}
+                  "itachi": "Itachi", "snap": "Snap", "clones": "Clones",
+                  "lava": "Lava"}
 GESTURE_THREAD = True
 
 
@@ -1190,6 +1210,11 @@ def observe_gestures(job: GestureJob, stamp) -> list[Observation]:
             if job.debug:
                 debug = (f"hands={recognizer.last_hand_count} "
                          f"pinch={recognizer.detector.pinched} snap={value}")
+        elif mode == "lava":
+            value = recognizer.recognize_thumb(image, stamp())
+            detail = recognizer.describe()
+            if job.debug:
+                debug = f"hands={recognizer.last_hand_count} thumb_up={recognizer.last_score:.2f}"
         elif mode in ("clones", "naruto"):
             if job.hand_source:
                 value = recognizer.observe(hands(), width, height)
@@ -1217,6 +1242,7 @@ def observe_gestures(job: GestureJob, stamp) -> list[Observation]:
 
 NARUTO_HOLD_SECONDS = 0.3
 CLONE_HOLD_SECONDS = 0.3
+LAVA_HOLD_SECONDS = 0.3
 ITACHI_HOLD_SECONDS = 0.3
 
 
@@ -1368,6 +1394,8 @@ def hud_status(mode: str, phase: str, calibration_remaining: int | None,
             return "Vanished: cross your arms again to reappear"
         if mode == "snap":
             return "Vanished: snap again to reappear"
+        if mode == "lava":
+            return "Vanished: thumbs up again to rise from the lava"
         return "Vanished: press R to reappear"
     if phase == "cloned":
         if not gestures:
@@ -1377,7 +1405,9 @@ def hud_status(mode: str, phase: str, calibration_remaining: int | None,
         return "Summoning clones..."
     if phase == "clones_leaving":
         return "Dismissing clones..."
-    if phase in ("goku_appearing", "itachi_appearing", "snap_appearing"):
+    if phase == "lava_sinking":
+        return "Sinking..."
+    if phase in ("goku_appearing", "itachi_appearing", "snap_appearing", "lava_rising"):
         return "Reappearing..."
     return "Vanishing..."
 
@@ -1511,12 +1541,14 @@ def run_camera(args: argparse.Namespace, resources: ExitStack, mode: str,
     exposure_gain: np.ndarray | None = None
     particle_effect: ParticleEffect | None = None
     itachi_effect: ItachiCrowEffect | None = None
+    lava_effect: LavaEffect | None = None
     itachi_gate = GokuGestureGate(hold_seconds=ITACHI_HOLD_SECONDS)
     goku_effect: GokuTeleport | None = None
     goku_delay = getattr(args, "goku_delay", None) or HOLD_SECONDS
     goku_gate = GokuGestureGate(hold_seconds=goku_delay)
     naruto_gate = GokuGestureGate(hold_seconds=NARUTO_HOLD_SECONDS)
     clone_gate = GokuGestureGate(hold_seconds=CLONE_HOLD_SECONDS)
+    lava_gate = GokuGestureGate(hold_seconds=LAVA_HOLD_SECONDS)
     clone_squad: CloneSquad | None = None
     goku_countdown_remaining: float | None = None
     snap_anchor_at: tuple[int, int, int] | None = None
@@ -1581,6 +1613,21 @@ def run_camera(args: argparse.Namespace, resources: ExitStack, mode: str,
         play_sound()
         print("[Snap] Reappearing." if appearing else "[Snap] Vanishing.")
 
+    def start_lava(image: mp.Image, appearing: bool) -> None:
+        """Sink into the lava, or rise from it (the person is standing there, hidden)."""
+        nonlocal lava_effect, last_mask, last_mask_at, vanished_frame
+        mask = person_mask(segmenter, image, stamp(), width, height)
+        last_mask, last_mask_at = mask, time.perf_counter()
+        try:
+            lava_effect = LavaEffect(scene_frame, mask)
+        except ValueError:
+            print("[Lava] Step into the frame first." if appearing else "[Lava] No person detected.")
+            return
+        state.phase = "lava_rising" if appearing else "lava_sinking"
+        state.vanish_started = last_mask_at
+        vanished_frame = None
+        print("[Lava] Rising from the lava." if appearing else "[Lava] Sinking into the lava.")
+
     def start_clones(image: mp.Image, appearing: bool) -> None:
         nonlocal clone_squad, last_mask, last_mask_at
         mask = person_mask(segmenter, image, stamp(), width, height)
@@ -1601,8 +1648,9 @@ def run_camera(args: argparse.Namespace, resources: ExitStack, mode: str,
         nonlocal log_anchor, last_mask, last_mask_at, vanished_frame, particle_effect
         nonlocal itachi_effect, goku_effect, goku_countdown_remaining, hud_detail
         nonlocal hidden_base_source, hidden_base, hidden_mask, exposure_gain, snap_anchor_at
-        nonlocal clone_squad
+        nonlocal clone_squad, lava_effect
         clone_squad = None
+        lava_effect = None
         state.vanish_started = None
         snap_anchor_at = None
         log_anchor = None
@@ -1615,14 +1663,14 @@ def run_camera(args: argparse.Namespace, resources: ExitStack, mode: str,
         goku_countdown_remaining = None
         hud_detail = ""
         hidden_base_source = hidden_base = hidden_mask = exposure_gain = None
-        for gate in (itachi_gate, goku_gate, naruto_gate, clone_gate):
+        for gate in (itachi_gate, goku_gate, naruto_gate, clone_gate, lava_gate):
             gate.reset()
         if "snap" in kits:
             kits["snap"][1].detector.reset()
 
     started = time.perf_counter()
     print("[Webcam] Step out of the frame for 4 seconds: capturing the background.")
-    print("[Webcam] Keys in the preview window: 1-7 toggle effects, SPACE recapture room, R reappear, "
+    print("[Webcam] Keys in the preview window: 1-8 toggle effects, SPACE recapture room, R reappear, "
           "V vanish, G gestures, M sound, B background, C camera, F fullscreen, H help, Q quit.")
 
     raise_pending = True
@@ -1737,6 +1785,8 @@ def run_camera(args: argparse.Namespace, resources: ExitStack, mode: str,
                         goku_countdown_remaining = None
                 elif mode == "snap" and value:
                     start_snap(to_mp_image(camera_frame), appearing=state.phase == "vanished")
+                elif mode == "lava" and lava_gate.update(value, checked_at):
+                    start_lava(to_mp_image(camera_frame), appearing=state.phase == "vanished")
                 elif mode == "clones" and clone_gate.update(value, checked_at):
                     start_clones(to_mp_image(camera_frame), appearing=state.phase == "ready")
                 elif mode == "naruto":
@@ -1796,6 +1846,15 @@ def run_camera(args: argparse.Namespace, resources: ExitStack, mode: str,
                     state.phase = "ready" if appearing else "vanished"
                     vanished_frame = None if appearing else display
                     itachi_effect = None
+
+            elif mode == "lava" and state.phase in ("lava_sinking", "lava_rising"):
+                appearing = state.phase == "lava_rising"
+                age = max(0.0, time.perf_counter() - state.vanish_started)
+                display = lava_effect.render(scene_background, age, appearing)
+                if age >= LAVA_SECONDS:
+                    state.phase = "ready" if appearing else "vanished"
+                    vanished_frame = None
+                    lava_effect = None
 
             elif mode == "clones" and state.phase in ("clones_appearing", "cloned", "clones_leaving"):
                 age = max(0.0, time.perf_counter() - state.vanish_started)
@@ -1918,7 +1977,7 @@ def run_camera(args: argparse.Namespace, resources: ExitStack, mode: str,
                                 goku_countdown_remaining, gestures_enabled)),
                     hud_detail if state.phase == "ready" or (
                         state.phase in ("vanished", "cloned")
-                        and mode in ("goku", "itachi", "snap", "clones")) else "",
+                        and mode in ("goku", "itachi", "snap", "clones", "lava")) else "",
                     vcam_text, vcam_color, hud_help,
                     {"b": style.label, "c": switcher.label(args.camera),
                      "g": "on" if gestures_enabled else "off", "m": "off" if muted else "on"},
@@ -1968,7 +2027,7 @@ def run_camera(args: argparse.Namespace, resources: ExitStack, mode: str,
                 print(f"[Webcam] Sound {'off' if muted else 'on'}.")
             elif key in (ord("g"), ord("G")):
                 gestures_enabled = not gestures_enabled
-                for gate in (itachi_gate, goku_gate, naruto_gate, clone_gate):
+                for gate in (itachi_gate, goku_gate, naruto_gate, clone_gate, lava_gate):
                     gate.reset()
                 if "snap" in kits:
                     kits["snap"][1].detector.reset()
@@ -2011,7 +2070,9 @@ def run_camera(args: argparse.Namespace, resources: ExitStack, mode: str,
                     start_snap(to_mp_image(camera_frame), appearing=True)
                 elif mode == "clones" and state.phase == "cloned":
                     start_clones(to_mp_image(camera_frame), appearing=False)
-                elif background is not None and mode not in ("goku", "itachi", "snap", "clones"):
+                elif background is not None and mode == "lava" and state.phase == "vanished":
+                    start_lava(to_mp_image(camera_frame), appearing=True)
+                elif background is not None and mode not in ("goku", "itachi", "snap", "clones", "lava"):
                     reset_effect()
                     state.phase = "ready"
             elif (key == ord("v") and background is not None and mode == "goku"
@@ -2031,7 +2092,9 @@ def run_camera(args: argparse.Namespace, resources: ExitStack, mode: str,
                 start_snap(to_mp_image(camera_frame), appearing=False)
             elif key == ord("v") and background is not None and mode == "clones" and state.phase == "ready":
                 start_clones(to_mp_image(camera_frame), appearing=True)
-            elif key == ord("v") and background is not None and mode not in ("goku", "itachi", "snap", "clones"):
+            elif key == ord("v") and background is not None and mode == "lava" and state.phase == "ready":
+                start_lava(to_mp_image(camera_frame), appearing=False)
+            elif key == ord("v") and background is not None and mode not in ("goku", "itachi", "snap", "clones", "lava"):
                 state.phase = "naruto_vanishing" if mode == "naruto" else "vanishing"
                 state.vanish_started = time.perf_counter()
                 if mode == "naruto":

@@ -25,6 +25,7 @@ from naruto_effect import (  # noqa: E402
 )
 from particles_effect import PARTICLE_SECONDS, ParticleEffect  # noqa: E402
 from clone_effect import CLONE_SECONDS, CloneSquad  # noqa: E402
+from lava_effect import LAVA_SECONDS, LavaEffect  # noqa: E402
 from snap_effect import SNAP_SECONDS, render_snap, snap_anchor  # noqa: E402
 
 WIDTH, HEIGHT = 480, 270
@@ -57,6 +58,7 @@ POSES = {
     "forehead": dict(IDLE, r_elbow=(48, 90), r_hand=(31, 43)),
     "crossed": dict(l_elbow=(-32, 132), l_hand=(22, 86), r_elbow=(32, 132), r_hand=(-22, 86)),
     "snap": dict(IDLE, r_elbow=(48, 100), r_hand=(46, 62)),
+    "thumbs": dict(IDLE, r_elbow=(46, 104), r_hand=(40, 70)),
     "seal": dict(l_elbow=(-36, 118), l_hand=(-14, 104), r_elbow=(36, 124), r_hand=(4, 116)),
 }
 HEAD, HIP = (0, 48), (0, 160)
@@ -99,6 +101,8 @@ def figure(background: np.ndarray, joints: dict, color: tuple[int, int, int],
         for side, dx in (("l", 7), ("r", -7)):
             wrist = np.array(pt(joints[f"{side}_hand"]))
             cv2.line(lines, tuple(wrist), tuple(wrist + (dx, -19)), 255, 3, cv2.LINE_AA)
+    elif detail == "thumbs":
+        cv2.line(lines, tuple(hand), tuple(hand + (0, -16)), 255, 4, cv2.LINE_AA)
     elif detail == "seal":
         left, right = np.array(pt(joints["l_hand"])), np.array(pt(joints["r_hand"]))
         cv2.line(lines, tuple(left), tuple(left + (26, 0)), 255, 3, cv2.LINE_AA)
@@ -243,6 +247,14 @@ def main() -> None:
     clip += [squad.render(frame, mask, t, "leaving") for t in timeline(CLONE_SECONDS)]
     clip += relax(background, "seal", orange, "seal")
     clips.append(captioned(clip, "7", "Clones", "crossed fingers: live shadow clones, again to dismiss"))
+
+    white = (235, 235, 235)
+    frame, mask = figure(background, POSES["thumbs"], white, "thumbs")
+    lava = LavaEffect(frame, mask)
+    speed = 1.4  # Shorten the 4.4 s sink for the GIF.
+    clip = gesture(background, "thumbs", white, "thumbs") + [
+        lava.render(background, t * speed) for t in timeline(LAVA_SECONDS / speed)] + hold(background, 0.3)
+    clips.append(captioned(clip, "8", "Lava", "thumbs up: sink into the lava"))
 
     frames = [Image.fromarray(cv2.cvtColor(f, cv2.COLOR_BGR2RGB)) for clip in clips for f in clip]
     samples = frames[::max(1, len(frames) // 24)]
